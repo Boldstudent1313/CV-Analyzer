@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Strategy B Matcher</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800">
+  <div class="max-w-5xl mx-auto py-10 px-4">
+    <header class="mb-8">
+      <h1 class="text-3xl font-bold">Strategy B: Lightweight Semantic Matcher</h1>
+      <p class="text-gray-600">Upload your CV and paste a job description to evaluate semantic alignment, enriched by web signals.</p>
+    </header>
+
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div class="bg-white p-6 rounded-xl shadow">
+        <h2 class="font-semibold mb-3">Upload CV / Paste Text</h2>
+        <div class="border-2 border-dashed rounded-lg p-6 text-center mb-4" id="dropzone">
+          <input type="file" id="fileInput" class="hidden" accept=".pdf,.txt" />
+          <button onclick="document.getElementById('fileInput').click()" class="px-4 py-2 bg-blue-600 text-white rounded">Select File</button>
+          <p class="mt-2 text-sm text-gray-500">PDF or TXT up to 2MB</p>
+        </div>
+        <label class="block text-sm font-medium mb-2" for="jobText">Job Requirements</label>
+        <textarea id="jobText" class="w-full h-48 border rounded p-3 focus:outline-none focus:ring" placeholder="Paste job description here..."></textarea>
+        <div class="mt-4 flex gap-3">
+          <button id="analyzeBtn" class="px-4 py-2 bg-emerald-600 text-white rounded">Analyze</button>
+          <button id="clearBtn" class="px-4 py-2 bg-gray-600 text-white rounded">Clear Results</button>
+        </div>
+      </div>
+
+      <div class="bg-white p-6 rounded-xl shadow">
+        <h2 class="font-semibold mb-3">Results</h2>
+        <div id="results" class="space-y-3">
+          <div class="p-3 rounded bg-gray-100">
+            <div class="text-sm text-gray-600">Overall Candidate Score</div>
+            <div id="score" class="text-2xl font-semibold">-</div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div class="p-3 rounded bg-gray-50">
+              <div class="text-xs text-gray-500">University Prestige</div>
+              <div id="uni" class="text-lg font-semibold">-</div>
+            </div>
+            <div class="p-3 rounded bg-gray-50">
+              <div class="text-xs text-gray-500">Company Tier</div>
+              <div id="company" class="text-lg font-semibold">-</div>
+            </div>
+            <div class="p-3 rounded bg-gray-50">
+              <div class="text-xs text-gray-500">Project Uniqueness</div>
+              <div id="project" class="text-lg font-semibold">-</div>
+            </div>
+          </div>
+          <div class="p-3 rounded bg-gray-50 text-xs text-gray-600" id="explain">Awaiting analysis...</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const fileInput = document.getElementById('fileInput');
+
+    clearBtn.addEventListener('click', async () => {
+      await fetch('/clear', { method: 'POST' });
+      document.getElementById('score').textContent = '-';
+      document.getElementById('uni').textContent = '-';
+      document.getElementById('company').textContent = '-';
+      document.getElementById('project').textContent = '-';
+      document.getElementById('explain').textContent = 'Cleared.';
+      document.getElementById('jobText').value = '';
+      fileInput.value = '';
+    });
+
+    analyzeBtn.addEventListener('click', async () => {
+      const jobText = document.getElementById('jobText').value || '';
+      const formData = new FormData();
+      if (fileInput.files.length > 0) {
+        formData.append('file', fileInput.files[0]);
+      }
+      formData.append('job', jobText);
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      const data = await res.json();
+      document.getElementById('score').textContent = (data.score ?? '-').toFixed ? (data.score).toFixed(3) : data.score;
+      document.getElementById('uni').textContent = data.uni_label || '-';
+      document.getElementById('company').textContent = data.company_label || '-';
+      document.getElementById('project').textContent = data.project_label || '-';
+      document.getElementById('explain').textContent = data.explain || JSON.stringify(data);
+    });
+  </script>
+</body>
+</html>
