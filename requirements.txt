@@ -1,7 +1,6 @@
 flask==3.0.2
 numpy==1.26.4
 duckduckgo_search==5.3.1
-requests==2.32.4
+requests==2.32.3
 beautifulsoup4==4.12.3
 pdfminer.six==20231228
-gunicorn==21.2.0
