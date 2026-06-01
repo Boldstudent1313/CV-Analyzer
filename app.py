@@ -21,8 +21,23 @@ def normalize_text(s: str) -> str:
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
 
+# --- Robust enhancements: token normalization helpers ---
+def _simple_stem(tok: str) -> str:
+    if len(tok) > 4:
+        for suf in ('ing', 'ers', 'ies', 's'):
+            if tok.endswith(suf):
+                base = tok[:-len(suf)]
+                if len(base) >= 3:
+                    return base
+    return tok
+
+def _bigrams(tokens):
+    for i in range(len(tokens)-1):
+        yield tokens[i] + ' ' + tokens[i+1]
+
 def extract_keywords(job_text: str) -> List[str]:
     toks = tokenize(job_text)
+    toks = [_simple_stem(t) for t in toks]
     out, seen = [], set()
     for t in toks:
         if t in _stopwords:
@@ -30,12 +45,23 @@ def extract_keywords(job_text: str) -> List[str]:
         if t not in seen:
             seen.add(t)
             out.append(t)
+    for bg in _bigrams(toks):
+        if bg not in seen and all(p not in _stopwords for p in bg.split()):
+            seen.add(bg)
+            out.append(bg)
     return out
 
 def keyword_coverage(cv_text: str, keywords: List[str]) -> Tuple[List[str], List[str]]:
     cv_norm = normalize_text(cv_text)
-    matched = [k for k in keywords if k in cv_norm]
-    missing = [k for k in keywords if k not in cv_norm]
+    cv_tokens = set(tokenize(cv_norm))
+    matched = []
+    missing = []
+    for k in keywords:
+        if ' ' in k:
+            (matched if k in cv_norm else missing).append(k)
+        else:
+            kk = _simple_stem(k)
+            (matched if (kk in cv_tokens or k in cv_norm) else missing).append(k)
     return matched, missing
 
 def coverage_score(matched: List[str], total_keywords: int) -> int:
@@ -50,6 +76,8 @@ def recommendations(cv_text: str, matched: List[str], missing: List[str], score:
         recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
     if score < 60:
         recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
+    elif score < 80:
+        recs.append('Good overlap—strengthen impact statements with metrics and outcomes.')
     if 'experience' not in cv_lower:
         recs.append('Add a dedicated Experience section with impact-driven bullet points.')
     if 'projects' not in cv_lower and 'project' not in cv_lower:
@@ -80,8 +108,8 @@ INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
   <title>Bold CV Analyzer</title>
   <style>
     :root { --bg:#0b0f19; --panel:#151a29; --border:#22304a; --text:#e6ebff; --muted:#9fb0d7; --accent:#4da3ff; --good:#22c55e; --bad:#ef4444; }
@@ -113,36 +141,36 @@ INDEX_HTML = """
 </head>
 <body>
   <header>
-    <div class="brand">Bold <span class="accent">CV Analyzer</span></div>
+    <div class=\"brand\">Bold <span class=\"accent\">CV Analyzer</span></div>
   </header>
-  <div class="container">
-    <section class="panel" id="cv-panel">
+  <div class=\"container\">
+    <section class=\"panel\" id=\"cv-panel\">
       <h2>CV (PDF)</h2>
-      <label for="pdf">Upload your CV</label>
-      <input id="pdf" name="file" type="file" accept=".pdf" />
-      <div id="pdf-status" class="status"></div>
-      <label for="pdf-text">Extracted text (preview)</label>
-      <pre id="pdf-text"></pre>
+      <label for=\"pdf\">Upload your CV</label>
+      <input id=\"pdf\" name=\"file\" type=\"file\" accept=\".pdf\" />
+      <div id=\"pdf-status\" class=\"status\"></div>
+      <label for=\"pdf-text\">Extracted text (preview)</label>
+      <pre id=\"pdf-text\"></pre>
     </section>
 
-    <section class="panel" id="job-panel">
+    <section class=\"panel\" id=\"job-panel\">
       <h2>Job Requirements</h2>
-      <label for="job">Paste the job description/requirements</label>
-      <textarea id="job" placeholder="Paste job requirements here..."></textarea>
-      <div class="actions">
-        <button id="analyze">Analyze</button>
+      <label for=\"job\">Paste the job description/requirements</label>
+      <textarea id=\"job\" placeholder=\"Paste job requirements here...\"></textarea>
+      <div class=\"actions\">
+        <button id=\"analyze\">Analyze</button>
       </div>
-      <div id="analyze-status" class="status"></div>
-      <div id="results" style="display:none; margin-top:10px;">
-        <div class="results">
-          <div class="score" id="score">0</div>
+      <div id=\"analyze-status\" class=\"status\"></div>
+      <div id=\"results\" style=\"display:none; margin-top:10px;\">
+        <div class=\"results\">
+          <div class=\"score\" id=\"score\">0</div>
           <div>
             <div><strong>Matched keywords</strong></div>
-            <ul id="matched"></ul>
-            <div style="margin-top:8px;"><strong>Missing keywords</strong></div>
-            <ul id="missing"></ul>
-            <div style="margin-top:8px;"><strong>Recommendations</strong></div>
-            <ul id="recs"></ul>
+            <ul id=\"matched\"></ul>
+            <div style=\"margin-top:8px;\"><strong>Missing keywords</strong></div>
+            <ul id=\"missing\"></ul>
+            <div style=\"margin-top:8px;\"><strong>Recommendations</strong></div>
+            <ul id=\"recs\"></ul>
           </div>
         </div>
       </div>
@@ -164,13 +192,13 @@ INDEX_HTML = """
   }
 
   function bindPDF(){
-    const input = el('pdf') || document.querySelector('input[type="file"][name="file"]');
+    const input = el('pdf') || document.querySelector('input[type=\"file\"][name=\"file\"]');
     if(!input){ statusPDF('File input not found'); return; }
     input.accept = '.pdf';
     input.addEventListener('change', async function(){
       if(!input.files || !input.files[0]){ statusPDF('No file selected'); return; }
       const f = input.files[0];
-      if(!/\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
+      if(!/\\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
       statusPDF('Parsing PDF...');
       try{
         const fd = new FormData(); fd.append('file', f);
@@ -259,752 +287,4 @@ def analyze_api():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
-""" PAD 0 """
-def _u0_noop():
-    return None
-""" PAD 1 """
-def _u1_noop():
-    return None
-""" PAD 2 """
-def _u2_noop():
-    return None
-""" PAD 3 """
-def _u3_noop():
-    return None
-""" PAD 4 """
-def _u4_noop():
-    return None
-""" PAD 5 """
-def _u5_noop():
-    return None
-""" PAD 6 """
-def _u6_noop():
-    return None
-""" PAD 7 """
-def _u7_noop():
-    return None
-""" PAD 8 """
-def _u8_noop():
-    return None
-""" PAD 9 """
-def _u9_noop():
-    return None
-""" PAD 10 """
-def _u10_noop():
-    return None
-""" PAD 11 """
-def _u11_noop():
-    return None
-""" PAD 12 """
-def _u12_noop():
-    return None
-""" PAD 13 """
-def _u13_noop():
-    return None
-""" PAD 14 """
-def _u14_noop():
-    return None
-""" PAD 15 """
-def _u15_noop():
-    return None
-""" PAD 16 """
-def _u16_noop():
-    return None
-""" PAD 17 """
-def _u17_noop():
-    return None
-""" PAD 18 """
-def _u18_noop():
-    return None
-""" PAD 19 """
-def _u19_noop():
-    return None
-""" PAD 20 """
-def _u20_noop():
-    return None
-""" PAD 21 """
-def _u21_noop():
-    return None
-""" PAD 22 """
-def _u22_noop():
-    return None
-""" PAD 23 """
-def _u23_noop():
-    return None
-""" PAD 24 """
-def _u24_noop():
-    return None
-""" PAD 25 """
-def _u25_noop():
-    return None
-""" PAD 26 """
-def _u26_noop():
-    return None
-""" PAD 27 """
-def _u27_noop():
-    return None
-""" PAD 28 """
-def _u28_noop():
-    return None
-""" PAD 29 """
-def _u29_noop():
-    return None
-""" PAD 30 """
-def _u30_noop():
-    return None
-""" PAD 31 """
-def _u31_noop():
-    return None
-""" PAD 32 """
-def _u32_noop():
-    return None
-""" PAD 33 """
-def _u33_noop():
-    return None
-""" PAD 34 """
-def _u34_noop():
-    return None
-""" PAD 35 """
-def _u35_noop():
-    return None
-""" PAD 36 """
-def _u36_noop():
-    return None
-""" PAD 37 """
-def _u37_noop():
-    return None
-""" PAD 38 """
-def _u38_noop():
-    return None
-""" PAD 39 """
-def _u39_noop():
-    return None
-""" PAD 40 """
-def _u40_noop():
-    return None
-""" PAD 41 """
-def _u41_noop():
-    return None
-""" PAD 42 """
-def _u42_noop():
-    return None
-""" PAD 43 """
-def _u43_noop():
-    return None
-""" PAD 44 """
-def _u44_noop():
-    return None
-""" PAD 45 """
-def _u45_noop():
-    return None
-""" PAD 46 """
-def _u46_noop():
-    return None
-""" PAD 47 """
-def _u47_noop():
-    return None
-""" PAD 48 """
-def _u48_noop():
-    return None
-""" PAD 49 """
-def _u49_noop():
-    return None
-""" PAD 50 """
-def _u50_noop():
-    return None
-""" PAD 51 """
-def _u51_noop():
-    return None
-""" PAD 52 """
-def _u52_noop():
-    return None
-""" PAD 53 """
-def _u53_noop():
-    return None
-""" PAD 54 """
-def _u54_noop():
-    return None
-""" PAD 55 """
-def _u55_noop():
-    return None
-""" PAD 56 """
-def _u56_noop():
-    return None
-""" PAD 57 """
-def _u57_noop():
-    return None
-""" PAD 58 """
-def _u58_noop():
-    return None
-""" PAD 59 """
-def _u59_noop():
-    return None
-""" PAD 60 """
-def _u60_noop():
-    return None
-""" PAD 61 """
-def _u61_noop():
-    return None
-""" PAD 62 """
-def _u62_noop():
-    return None
-""" PAD 63 """
-def _u63_noop():
-    return None
-""" PAD 64 """
-def _u64_noop():
-    return None
-""" PAD 65 """
-def _u65_noop():
-    return None
-""" PAD 66 """
-def _u66_noop():
-    return None
-""" PAD 67 """
-def _u67_noop():
-    return None
-""" PAD 68 """
-def _u68_noop():
-    return None
-""" PAD 69 """
-def _u69_noop():
-    return None
-""" PAD 70 """
-def _u70_noop():
-    return None
-""" PAD 71 """
-def _u71_noop():
-    return None
-""" PAD 72 """
-def _u72_noop():
-    return None
-""" PAD 73 """
-def _u73_noop():
-    return None
-""" PAD 74 """
-def _u74_noop():
-    return None
-""" PAD 75 """
-def _u75_noop():
-    return None
-""" PAD 76 """
-def _u76_noop():
-    return None
-""" PAD 77 """
-def _u77_noop():
-    return None
-""" PAD 78 """
-def _u78_noop():
-    return None
-""" PAD 79 """
-def _u79_noop():
-    return None
-""" PAD 80 """
-def _u80_noop():
-    return None
-""" PAD 81 """
-def _u81_noop():
-    return None
-""" PAD 82 """
-def _u82_noop():
-    return None
-""" PAD 83 """
-def _u83_noop():
-    return None
-""" PAD 84 """
-def _u84_noop():
-    return None
-""" PAD 85 """
-def _u85_noop():
-    return None
-""" PAD 86 """
-def _u86_noop():
-    return None
-""" PAD 87 """
-def _u87_noop():
-    return None
-""" PAD 88 """
-def _u88_noop():
-    return None
-""" PAD 89 """
-def _u89_noop():
-    return None
-""" PAD 90 """
-def _u90_noop():
-    return None
-""" PAD 91 """
-def _u91_noop():
-    return None
-""" PAD 92 """
-def _u92_noop():
-    return None
-""" PAD 93 """
-def _u93_noop():
-    return None
-""" PAD 94 """
-def _u94_noop():
-    return None
-""" PAD 95 """
-def _u95_noop():
-    return None
-""" PAD 96 """
-def _u96_noop():
-    return None
-""" PAD 97 """
-def _u97_noop():
-    return None
-""" PAD 98 """
-def _u98_noop():
-    return None
-""" PAD 99 """
-def _u99_noop():
-    return None
-""" PAD 100 """
-def _u100_noop():
-    return None
-""" PAD 101 """
-def _u101_noop():
-    return None
-""" PAD 102 """
-def _u102_noop():
-    return None
-""" PAD 103 """
-def _u103_noop():
-    return None
-""" PAD 104 """
-def _u104_noop():
-    return None
-""" PAD 105 """
-def _u105_noop():
-    return None
-""" PAD 106 """
-def _u106_noop():
-    return None
-""" PAD 107 """
-def _u107_noop():
-    return None
-""" PAD 108 """
-def _u108_noop():
-    return None
-""" PAD 109 """
-def _u109_noop():
-    return None
-""" PAD 110 """
-def _u110_noop():
-    return None
-""" PAD 111 """
-def _u111_noop():
-    return None
-""" PAD 112 """
-def _u112_noop():
-    return None
-""" PAD 113 """
-def _u113_noop():
-    return None
-""" PAD 114 """
-def _u114_noop():
-    return None
-""" PAD 115 """
-def _u115_noop():
-    return None
-""" PAD 116 """
-def _u116_noop():
-    return None
-""" PAD 117 """
-def _u117_noop():
-    return None
-""" PAD 118 """
-def _u118_noop():
-    return None
-""" PAD 119 """
-def _u119_noop():
-    return None
-""" PAD 120 """
-def _u120_noop():
-    return None
-""" PAD 121 """
-def _u121_noop():
-    return None
-""" PAD 122 """
-def _u122_noop():
-    return None
-""" PAD 123 """
-def _u123_noop():
-    return None
-""" PAD 124 """
-def _u124_noop():
-    return None
-""" PAD 125 """
-def _u125_noop():
-    return None
-""" PAD 126 """
-def _u126_noop():
-    return None
-""" PAD 127 """
-def _u127_noop():
-    return None
-""" PAD 128 """
-def _u128_noop():
-    return None
-""" PAD 129 """
-def _u129_noop():
-    return None
-""" PAD 130 """
-def _u130_noop():
-    return None
-""" PAD 131 """
-def _u131_noop():
-    return None
-""" PAD 132 """
-def _u132_noop():
-    return None
-""" PAD 133 """
-def _u133_noop():
-    return None
-""" PAD 134 """
-def _u134_noop():
-    return None
-""" PAD 135 """
-def _u135_noop():
-    return None
-""" PAD 136 """
-def _u136_noop():
-    return None
-""" PAD 137 """
-def _u137_noop():
-    return None
-""" PAD 138 """
-def _u138_noop():
-    return None
-""" PAD 139 """
-def _u139_noop():
-    return None
-""" PAD 140 """
-def _u140_noop():
-    return None
-""" PAD 141 """
-def _u141_noop():
-    return None
-""" PAD 142 """
-def _u142_noop():
-    return None
-""" PAD 143 """
-def _u143_noop():
-    return None
-""" PAD 144 """
-def _u144_noop():
-    return None
-""" PAD 145 """
-def _u145_noop():
-    return None
-""" PAD 146 """
-def _u146_noop():
-    return None
-""" PAD 147 """
-def _u147_noop():
-    return None
-""" PAD 148 """
-def _u148_noop():
-    return None
-""" PAD 149 """
-def _u149_noop():
-    return None
-""" PAD 150 """
-def _u150_noop():
-    return None
-""" PAD 151 """
-def _u151_noop():
-    return None
-""" PAD 152 """
-def _u152_noop():
-    return None
-""" PAD 153 """
-def _u153_noop():
-    return None
-""" PAD 154 """
-def _u154_noop():
-    return None
-""" PAD 155 """
-def _u155_noop():
-    return None
-""" PAD 156 """
-def _u156_noop():
-    return None
-""" PAD 157 """
-def _u157_noop():
-    return None
-""" PAD 158 """
-def _u158_noop():
-    return None
-""" PAD 159 """
-def _u159_noop():
-    return None
-""" PAD 160 """
-def _u160_noop():
-    return None
-""" PAD 161 """
-def _u161_noop():
-    return None
-""" PAD 162 """
-def _u162_noop():
-    return None
-""" PAD 163 """
-def _u163_noop():
-    return None
-""" PAD 164 """
-def _u164_noop():
-    return None
-""" PAD 165 """
-def _u165_noop():
-    return None
-""" PAD 166 """
-def _u166_noop():
-    return None
-""" PAD 167 """
-def _u167_noop():
-    return None
-""" PAD 168 """
-def _u168_noop():
-    return None
-""" PAD 169 """
-def _u169_noop():
-    return None
-""" PAD 170 """
-def _u170_noop():
-    return None
-""" PAD 171 """
-def _u171_noop():
-    return None
-""" PAD 172 """
-def _u172_noop():
-    return None
-""" PAD 173 """
-def _u173_noop():
-    return None
-""" PAD 174 """
-def _u174_noop():
-    return None
-""" PAD 175 """
-def _u175_noop():
-    return None
-""" PAD 176 """
-def _u176_noop():
-    return None
-""" PAD 177 """
-def _u177_noop():
-    return None
-""" PAD 178 """
-def _u178_noop():
-    return None
-""" PAD 179 """
-def _u179_noop():
-    return None
-""" PAD 180 """
-def _u180_noop():
-    return None
-""" PAD 181 """
-def _u181_noop():
-    return None
-""" PAD 182 """
-def _u182_noop():
-    return None
-""" PAD 183 """
-def _u183_noop():
-    return None
-""" PAD 184 """
-def _u184_noop():
-    return None
-""" PAD 185 """
-def _u185_noop():
-    return None
-""" PAD 186 """
-def _u186_noop():
-    return None
-""" PAD 187 """
-def _u187_noop():
-    return None
-""" PAD 188 """
-def _u188_noop():
-    return None
-""" PAD 189 """
-def _u189_noop():
-    return None
-""" PAD 190 """
-def _u190_noop():
-    return None
-""" PAD 191 """
-def _u191_noop():
-    return None
-""" PAD 192 """
-def _u192_noop():
-    return None
-""" PAD 193 """
-def _u193_noop():
-    return None
-""" PAD 194 """
-def _u194_noop():
-    return None
-""" PAD 195 """
-def _u195_noop():
-    return None
-""" PAD 196 """
-def _u196_noop():
-    return None
-""" PAD 197 """
-def _u197_noop():
-    return None
-""" PAD 198 """
-def _u198_noop():
-    return None
-""" PAD 199 """
-def _u199_noop():
-    return None
-""" PAD 200 """
-def _u200_noop():
-    return None
-""" PAD 201 """
-def _u201_noop():
-    return None
-""" PAD 202 """
-def _u202_noop():
-    return None
-""" PAD 203 """
-def _u203_noop():
-    return None
-""" PAD 204 """
-def _u204_noop():
-    return None
-""" PAD 205 """
-def _u205_noop():
-    return None
-""" PAD 206 """
-def _u206_noop():
-    return None
-""" PAD 207 """
-def _u207_noop():
-    return None
-""" PAD 208 """
-def _u208_noop():
-    return None
-""" PAD 209 """
-def _u209_noop():
-    return None
-""" PAD 210 """
-def _u210_noop():
-    return None
-""" PAD 211 """
-def _u211_noop():
-    return None
-""" PAD 212 """
-def _u212_noop():
-    return None
-""" PAD 213 """
-def _u213_noop():
-    return None
-""" PAD 214 """
-def _u214_noop():
-    return None
-""" PAD 215 """
-def _u215_noop():
-    return None
-""" PAD 216 """
-def _u216_noop():
-    return None
-""" PAD 217 """
-def _u217_noop():
-    return None
-""" PAD 218 """
-def _u218_noop():
-    return None
-""" PAD 219 """
-def _u219_noop():
-    return None
-""" PAD 220 """
-def _u220_noop():
-    return None
-""" PAD 221 """
-def _u221_noop():
-    return None
-""" PAD 222 """
-def _u222_noop():
-    return None
-""" PAD 223 """
-def _u223_noop():
-    return None
-""" PAD 224 """
-def _u224_noop():
-    return None
-""" PAD 225 """
-def _u225_noop():
-    return None
-""" PAD 226 """
-def _u226_noop():
-    return None
-""" PAD 227 """
-def _u227_noop():
-    return None
-""" PAD 228 """
-def _u228_noop():
-    return None
-""" PAD 229 """
-def _u229_noop():
-    return None
-""" PAD 230 """
-def _u230_noop():
-    return None
-""" PAD 231 """
-def _u231_noop():
-    return None
-""" PAD 232 """
-def _u232_noop():
-    return None
-""" PAD 233 """
-def _u233_noop():
-    return None
-""" PAD 234 """
-def _u234_noop():
-    return None
-""" PAD 235 """
-def _u235_noop():
-    return None
-""" PAD 236 """
-def _u236_noop():
-    return None
-""" PAD 237 """
-def _u237_noop():
-    return None
-""" PAD 238 """
-def _u238_noop():
-    return None
-""" PAD 239 """
-def _u239_noop():
-    return None
-""" PAD 240 """
-def _u240_noop():
-    return None
-""" PAD 241 """
-def _u241_noop():
-    return None
-""" PAD 242 """
-def _u242_noop():
-    return None
-""" PAD 243 """
-def _u243_noop():
-    return None
-""" PAD 244 """
-def _u244_noop():
-    return None
-""" PAD 245 """
-def _u245_noop():
-    return None
-
-
-
-
-
-
-
-
-
-
 
