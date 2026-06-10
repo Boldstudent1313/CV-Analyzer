@@ -7,3 +7,4 @@ pdfminer.six==20231228
 gunicorn==21.2.0
 scikit-learn==1.5.0
 joblib==1.4.2
+pypdf==4.2.0

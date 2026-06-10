@@ -147,24 +147,54 @@ def analyze_hybrid(cv_text: str, job_text: str):
 
 # ---------------- PDF parsing ----------------
 
+
+# ---------------- Hardened PDF/text parsing ----------------
+
 def parse_pdf_bytes(data: bytes) -> str:
     if not data:
         return ''
+    # Try pdfminer
+    text = ''
     try:
-        from pdfminer.high_level import extract_text
-    except Exception:
-        return ''
-    tmp_path = '_upload_tmp.pdf'
-    try:
+        from pdfminer.high_level import extract_text as _pdf_extract
+        tmp_path = '_upload_tmp.pdf'
         with open(tmp_path, 'wb') as tmp:
             tmp.write(data)
-        text = extract_text(tmp_path) or ''
-    finally:
         try:
-            os.remove(tmp_path)
+            text = _pdf_extract(tmp_path) or ''
+        finally:
+            try: os.remove(tmp_path)
+            except Exception: pass
+    except Exception:
+        text = ''
+    # Fallback: try pypdf (if installed)
+    if not text:
+        try:
+            import io
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for i, p in enumerate(reader.pages):
+                try:
+                    pages.append(p.extract_text() or '')
+                except Exception:
+                    pages.append('')
+                if len(pages) >= 20: # cap
+                    break
+            text = '
+'.join([t for t in pages if t])
+        except Exception:
+            text = ''
+    # Fallback: treat as text if begins with %PDF missing or corrupt but contains readable ASCII
+    if not text:
+        try:
+            guess = data.decode('utf-8', errors='ignore')
+            # Heuristic: if a fair amount of letters present, accept
+            if len(re.findall(r'[A-Za-z]{2,}', guess)) > 50:
+                text = guess
         except Exception:
             pass
-    return text
+    return text or ''
 
 # ---------------- UI template (relax blocker, allow paste) ----------------
 INDEX_HTML = """
