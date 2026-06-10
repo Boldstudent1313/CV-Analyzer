@@ -14,3 +14,8 @@ Key features:
 Deployment:
 - Designed to run on Vercel Python builder; top-level `app = Flask(__name__)` is guaranteed
 - Small dependency footprint to respect 250MB runtime constraints
+
+## Deployment Notes
+
+- Configure Vercel Python builder.
+- Provide environment if needed.
