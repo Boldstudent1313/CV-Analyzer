@@ -181,8 +181,7 @@ def parse_pdf_bytes(data: bytes) -> str:
                     pages.append('')
                 if len(pages) >= 20: # cap
                     break
-            text = '
-'.join([t for t in pages if t])
+            text = '\n'.join([t for t in pages if t])
         except Exception:
             text = ''
     # Fallback: treat as text if begins with %PDF missing or corrupt but contains readable ASCII
