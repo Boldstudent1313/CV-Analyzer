@@ -1,0 +1,14 @@
+[
+  {
+    "id": "cv_001",
+    "text": "Summary: Data scientist with 5 years of experience building ML systems for marketing attribution and churn prediction. Skilled in Python, scikit-learn, and SQL. \nExperience:\n- Built end-to-end churn prediction pipeline (AUC 0.86) using gradient boosting; reduced churn by 12%.\n- Deployed marketing mix model that improved ROAS by 18%.\nProjects:\n- NLP intent classifier using logistic regression on TF-IDF features.\nSkills: Python, Pandas, scikit-learn, SQL, Airflow, Docker, AWS\nEducation: BSc Computer Science"
+  },
+  {
+    "id": "cv_002",
+    "text": "Summary: Backend engineer specializing in microservices and cloud infrastructure. \nExperience:\n- Designed REST APIs and event-driven services with Kafka.\n- Optimized PostgreSQL queries reducing latency by 40%.\nProjects:\n- Containerized applications with Docker and deployed on Kubernetes.\nSkills: Go, Python, Docker, Kubernetes, AWS, Terraform\nEducation: BEng Software Engineering"
+  },
+  {
+    "id": "cv_003",
+    "text": "Summary: Machine learning engineer focusing on computer vision and MLOps.\nExperience:\n- Trained CNNs for defect detection, achieving 95% recall.\n- Built CI/CD for ML models with MLflow and Docker.\nProjects:\n- Image segmentation pipeline with U-Net.\nSkills: Python, PyTorch, OpenCV, MLflow, Docker, GCP\nEducation: MSc Data Science"
+  }
+]

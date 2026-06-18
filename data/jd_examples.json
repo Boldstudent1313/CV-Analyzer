@@ -1,0 +1,17 @@
+[
+  {
+    "id": "jd_ds_001",
+    "role": "Data Scientist",
+    "text": "We are seeking a data scientist to build predictive models for marketing and retention.\nRequirements:\n- 3+ years experience with Python, scikit-learn, and SQL\n- Proven track record in churn prediction or attribution modeling\n- Ability to deploy end-to-end data pipelines (Airflow preferred)\n- Experience communicating impact using metrics (AUC, ROAS)"
+  },
+  {
+    "id": "jd_be_001",
+    "role": "Backend Engineer",
+    "text": "Looking for a backend engineer to design and scale microservices.\nRequirements:\n- Expertise with Docker and Kubernetes\n- Strong database fundamentals (PostgreSQL)\n- Experience with event-driven systems (Kafka)\n- Cloud (AWS) experience"
+  },
+  {
+    "id": "jd_mle_001",
+    "role": "ML Engineer",
+    "text": "Hiring an ML engineer for computer vision and MLOps.\nRequirements:\n- Experience training CNNs with PyTorch\n- Image segmentation projects\n- MLOps tools (MLflow, Docker) and cloud (GCP/AWS)\n- Strong Python skills"
+  }
+]
