@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from flask import Flask, render_template_string, request, jsonify
 import os, re, json
@@ -5,8 +6,10 @@ from typing import List, Tuple
 
 app = Flask(__name__)
 
+# ---------------- Core text utils ----------------
 _token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
 _stopwords = { 'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from','this','that','you','your','we','our','they','their','them','it','its','if','else','then','will','shall','can','may','must','should' }
+
 
 def normalize_text(s: str) -> str:
     s = '' if s is None else str(s)
@@ -14,8 +17,11 @@ def normalize_text(s: str) -> str:
     s = re.sub(r'\s+',' ', s).strip().lower()
     return s
 
+
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
+
+# ---------------- Keyword branch (fallback and for hybrid) ----------------
 
 def extract_keywords(job_text: str) -> List[str]:
     toks = tokenize(job_text)
@@ -24,8 +30,10 @@ def extract_keywords(job_text: str) -> List[str]:
         if t in _stopwords:
             continue
         if t not in seen:
-            seen.add(t); out.append(t)
+            seen.add(t)
+            out.append(t)
     return out
+
 
 def keyword_coverage(cv_text: str, keywords: List[str]) -> Tuple[List[str], List[str]]:
     cv_norm = normalize_text(cv_text)
@@ -33,103 +41,115 @@ def keyword_coverage(cv_text: str, keywords: List[str]) -> Tuple[List[str], List
     missing = [k for k in keywords if k not in cv_norm]
     return matched, missing
 
+
 def coverage_score(matched: List[str], total_keywords: int) -> int:
-    if total_keywords <= 0: return 0
-    return int(round((len(matched)/float(total_keywords))*100))
+    if total_keywords <= 0:
+        return 0
+    return int(round((len(matched) / float(total_keywords)) * 100))
 
-def recommendations(cv_text: str, matched: List[str], missing: List[str], score: int) -> List[str]:
-    cv_lower = normalize_text(cv_text)
-    recs = []
-    if missing:
-        recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
-    if score < 60:
-        recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
-    if 'experience' not in cv_lower:
-        recs.append('Add a dedicated Experience section with impact-driven bullet points.')
-    if 'projects' not in cv_lower and 'project' not in cv_lower:
-        recs.append('Include 1–2 relevant projects with outcomes and technologies used.')
-    return recs
-
-ART_DIR = 'artifacts'
-word_vec = None
-char_vec = None
-pair_clf = None
-threshold = 0.5
+# ---------------- Semantic-lite branch (no training, no LLM) ----------------
+# Use unsupervised TF-IDF and cosine to compute semantic-like similarity between
+# job requirement units and CV chunks. This is not a keyword counter; cosine
+# similarity over TF-IDF emphasizes informative n-grams and de-emphasizes stopwords.
 
 try:
-    import joblib
-    if os.path.exists(os.path.join(ART_DIR, 'tfidf_word.joblib')):
-        word_vec = joblib.load(os.path.join(ART_DIR, 'tfidf_word.joblib'))
-        char_vec = joblib.load(os.path.join(ART_DIR, 'tfidf_char.joblib'))
-        pair_clf = joblib.load(os.path.join(ART_DIR, 'pair_clf.joblib'))
-        cfgp = os.path.join(ART_DIR, 'config.json')
-        if os.path.exists(cfgp):
-            threshold = float(json.load(open(cfgp))['threshold'])
-except Exception as _e:
-    word_vec = None
-    char_vec = None
-    pair_clf = None
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
 
-_split_re = re.compile(r"[\n\r]+|\.\s+|;\s+|\-\s+")
+_SPLIT_RE = re.compile(r"[\n\r]+|\.\s+|;\s+|\u2022\s+|\-\s+")
 
-def split_units(text: str):
-    parts = _split_re.split(text or '')
-    return [p.strip() for p in parts if len(p.strip()) > 3]
 
-from math import isfinite
+def split_units(text: str, cap: int = 1200) -> List[str]:
+    parts = _SPILT_FIX if False else _SPLIT_RE.split(text or '')  # keep simple, avoid NameError
+    out = [p.strip() for p in parts if len(p.strip()) > 6]
+    return out[:cap]
 
-def pair_score(j_unit: str, c_unit: str) -> float:
-    try:
-        import numpy as np
-    except Exception:
-        return 0.0
-    if word_vec is None or char_vec is None or pair_clf is None:
-        return 0.0
-    ju = [j_unit]; cu = [c_unit]
-    X_jw = word_vec.transform(ju); X_cw = word_vec.transform(cu)
-    X_jc = char_vec.transform(ju); X_cc = char_vec.transform(cu)
-    sim_word = (X_jw.multiply(X_cw)).sum(axis=1)
-    sim_char = (X_jc.multiply(X_cc)).sum(axis=1)
-    import numpy as np
-    X = np.hstack([np.asarray(sim_word).reshape(-1,1), np.asarray(sim_char).reshape(-1,1)])
-    try:
-        proba = float(pair_clf.predict_proba(X)[:,1][0])
-        return proba if isfinite(proba) else 0.0
-    except Exception:
-        return 0.0
 
-def analyze_semantic(cv_text: str, job_text: str):
-    j_units = split_units(job_text)
-    c_units = split_units(cv_text)
+def tfidf_semantic_score(job_text: str, cv_text: str):
+    if TfidfVectorizer is None or cosine_similarity is None:
+        return None
+    j_units = split_units(job_text, cap=200)
+    c_units = split_units(cv_text, cap=800)
     if not j_units or not c_units:
         return {'match_score': 0, 'matched': [], 'missing': j_units if j_units else [], 'pairs': []}
+    # Build a joint TF-IDF over job+cv chunks to avoid OOV issues
+    docs = j_units + c_units
+    # Use char and word n-grams for robustness; build two vectorizers and concatenate similarities
+    word_vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_df=0.99)
+    char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3, 5), min_df=1)
+    try:
+        Xw = word_vec.fit_transform(docs)
+        Xc = char_vec.fit_transform(docs)
+    except Exception:
+        return None
+    Jw, Cw = Xw[: len(j_units), :], Xw[len(j_units) :, :]
+    Jc, Cc = Xc[: len(j_units), :], Xc[len(j_units) :, :]
+    # Cosine similarities
+    Sw = cosine_similarity(Jw, Cw)
+    Sc = cosine_similarity(Jc, Cc)
+    # Combine
+    S = 0.6 * Sw + 0.4 * Sc
     pairs = []
     covered, missing = [], []
-    for ju in j_units:
-        best = (None, 0.0)
-        for cu in c_units:
-            sc = pair_score(ju, cu)
-            if sc > best[1]:
-                best = (cu, sc)
-        pairs.append({'job_unit': ju, 'cv_unit': best[0], 'score': best[1]})
-        (covered if best[1] >= threshold else missing).append(ju)
-    avg = sum(p['score'] for p in pairs)/len(pairs)
-    return {'match_score': int(round(avg*100)), 'matched': covered, 'missing': missing, 'pairs': pairs}
+    threshold = 0.35  # conservative default for unsupervised
+    for i, ju in enumerate(j_units):
+        jrow = S[i]
+        jbest_idx = int(jrow.argmax())
+        jbest = float(jrow[jbest_idx])
+        cv_best = c_units[jbest_idx]
+        pairs.append({'job_unit': ju, 'cv_unit': cv_best, 'score': jbest})
+        (covered if jbest >= threshold else missing).append(ju)
+    avg = sum(p['score'] for p in pairs) / max(1, len(pairs))
+    match_score = int(round(max(0.0, min(1.0, avg)) * 100))
+    return {'match_score': match_score, 'matched': covered, 'missing': missing, 'pairs': pairs}
 
-from pdfminer.high_level import extract_text as _extract
+# ---------------- Hybrid inference ----------------
+
+def analyze_hybrid(cv_text: str, job_text: str):
+    # Try semantic-lite first
+    sem = tfidf_semantic_score(job_text, cv_text)
+    if sem is None:
+        # fall back to keyword coverage only
+        kws = extract_keywords(job_text)
+        matched, missing = keyword_coverage(cv_text, kws)
+        score = coverage_score(matched, len(kws))
+        return score, matched, missing
+    # Blend with light keyword signal to stabilize edge cases
+    kws = extract_keywords(job_text)
+    kmatched, kmissing = keyword_coverage(cv_text, kws)
+    kscore = coverage_score(kmatched, len(kws)) if kws else 0
+    # Weighted blend: 80% semantic, 20% keyword
+    score = int(round(0.8 * sem['match_score'] + 0.2 * kscore))
+    # For UI compatibility, use matched/missing from semantic job units
+    matched = sem['matched'][:50]
+    missing = sem['missing'][:50]
+    return score, matched, missing
+
+# ---------------- PDF parsing ----------------
 
 def parse_pdf_bytes(data: bytes) -> str:
-    if not data: return ''
+    if not data:
+        return ''
+    try:
+        from pdfminer.high_level import extract_text
+    except Exception:
+        return ''
     tmp_path = '_upload_tmp.pdf'
     try:
         with open(tmp_path, 'wb') as tmp:
             tmp.write(data)
-        text = _extract(tmp_path) or ''
+        text = extract_text(tmp_path) or ''
     finally:
-        try: os.remove(tmp_path)
-        except Exception: pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
     return text
 
+# ---------------- UI template (unchanged layout) ----------------
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -248,8 +268,7 @@ INDEX_HTML = """
 </html>
 """
 
-from flask import Flask, render_template_string, request, jsonify
-
+# ---------------- Routes ----------------
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -283,16 +302,13 @@ def analyze_api():
         job = data.get('job_text') or ''
         if not cv.strip() or not job.strip():
             return jsonify({'ok': False, 'error': 'cv_text and job_text are required'}), 400
-        if pair_clf is not None:
-            res = analyze_semantic(cv, job)
-            matched = res['matched']
-            missing = res['missing']
-            score = res['match_score']
-        else:
-            kws = extract_keywords(job)
-            matched, missing = keyword_coverage(cv, kws)
-            score = coverage_score(matched, len(kws))
-        recs = recommendations(cv, matched, missing, score)
+        score, matched, missing = analyze_hybrid(cv, job)
+        # Simple recommendations
+        recs = []
+        if missing:
+            recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
+        if score < 60:
+            recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
         return jsonify({'ok': True, 'match_score': score, 'matched_keywords': matched, 'missing_keywords': missing, 'recommendations': recs})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
