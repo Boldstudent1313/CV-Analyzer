@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 from flask import Flask, render_template_string, request, jsonify
-import os, re, json
+import os, re, json, time
 from typing import List, Tuple
 
 app = Flask(__name__)
@@ -21,37 +21,8 @@ def normalize_text(s: str) -> str:
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
 
-# ---------------- Keyword branch (fallback and for hybrid) ----------------
-
-def extract_keywords(job_text: str) -> List[str]:
-    toks = tokenize(job_text)
-    out, seen = [], set()
-    for t in toks:
-        if t in _stopwords:
-            continue
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def keyword_coverage(cv_text: str, keywords: List[str]) -> Tuple[List[str], List[str]]:
-    cv_norm = normalize_text(cv_text)
-    matched = [k for k in keywords if k in cv_norm]
-    missing = [k for k in keywords if k not in cv_norm]
-    return matched, missing
-
-
-def coverage_score(matched: List[str], total_keywords: int) -> int:
-    if total_keywords <= 0:
-        return 0
-    return int(round((len(matched) / float(total_keywords)) * 100))
-
 # ---------------- Semantic-lite branch (no training, no LLM) ----------------
-# Use unsupervised TF-IDF and cosine to compute semantic-like similarity between
-# job requirement units and CV chunks. This is not a keyword counter; cosine
-# similarity over TF-IDF emphasizes informative n-grams and de-emphasizes stopwords.
-
+# Unsupervised TF-IDF cosine similarity between job requirement units and CV chunks.
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -63,70 +34,116 @@ _SPLIT_RE = re.compile(r"[\n\r]+|\.\s+|;\s+|\u2022\s+|\-\s+")
 
 
 def split_units(text: str, cap: int = 1200) -> List[str]:
-    parts = _SPILT_FIX if False else _SPLIT_RE.split(text or '')  # keep simple, avoid NameError
+    parts = _SPLIT_RE.split(text or '')
     out = [p.strip() for p in parts if len(p.strip()) > 6]
     return out[:cap]
 
+# ---------------- Enrichment (bounded, cached) ----------------
+# Lightweight enrichment using Wikipedia summaries with tight timeouts and caching
+_enrich_cache_path = 'artifacts/enrich_cache.json'
+_enrich_cache = {}
+if os.path.exists(_enrich_cache_path):
+    try:
+        _enrich_cache = json.load(open(_enrich_cache_path, 'r', encoding='utf-8'))
+    except Exception:
+        _enrich_cache = {}
 
-def tfidf_semantic_score(job_text: str, cv_text: str):
+SAFE_SOURCES = ['https://en.wikipedia.org/api/rest_v1/page/summary/']
+
+
+def extract_rare_terms(cv_text: str, top_k: int = 12) -> List[str]:
+    toks = tokenize(cv_text)
+    # naive rarity: keep tokens with digits/symbols or longer tech-like tokens
+    cands = [t for t in toks if (any(ch.isdigit() for ch in t) or len(t) >= 6) and t not in _stopwords]
+    # keep unique preserving order
+    seen, out = set(), []
+    for t in cands:
+        if t not in seen:
+            seen.add(t); out.append(t)
+        if len(out) >= top_k:
+            break
+    return out
+
+
+def wiki_summary(term: str, timeout_sec: float = 1.2) -> str:
+    key = f'wik:{term}'
+    if key in _enrich_cache:
+        return _enrich_cache[key]
+    try:
+        import requests
+        url = SAFE_SOURCES[0] + requests.utils.quote(term)
+        r = requests.get(url, timeout=timeout_sec, headers={'User-Agent':'cv-analyzer/1.0'})
+        if r.status_code == 200:
+            data = r.json()
+            summ = data.get('extract') or ''
+            summ = re.sub(r'\s+', ' ', summ).strip()
+            if summ:
+                _enrich_cache[key] = summ[:400]
+                # best-effort persist
+                try:
+                    os.makedirs(os.path.dirname(_enrich_cache_path), exist_ok=True)
+                    json.dump(_enrich_cache, open(_enrich_cache_path,'w',encoding='utf-8'))
+                except Exception:
+                    pass
+                return _enrich_cache[key]
+    except Exception:
+        pass
+    _enrich_cache[key] = ''
+    return ''
+
+
+def build_enriched_cv(cv_text: str) -> str:
+    # append short summaries of rare terms to expand context
+    terms = extract_rare_terms(cv_text, top_k=10)
+    snippets = []
+    for t in terms:
+        s = wiki_summary(t)
+        if s:
+            snippets.append(f'{t}: {s}')
+        if len(snippets) >= 5:  # cap
+            break
+    if not snippets:
+        return cv_text
+    return cv_text + '\n\n' + '\n'.join(snippets)
+
+# ---------------- Hybrid inference (semantic-lite + enrichment) ----------------
+
+def analyze_hybrid(cv_text: str, job_text: str):
     if TfidfVectorizer is None or cosine_similarity is None:
-        return None
+        # Semantic path unavailable
+        return 0, [], []
+    # Enrich CV text with bounded external context
+    cv_enriched = build_enriched_cv(cv_text)
     j_units = split_units(job_text, cap=200)
-    c_units = split_units(cv_text, cap=800)
+    c_units = split_units(cv_enriched, cap=900)
     if not j_units or not c_units:
-        return {'match_score': 0, 'matched': [], 'missing': j_units if j_units else [], 'pairs': []}
-    # Build a joint TF-IDF over job+cv chunks to avoid OOV issues
+        return 0, j_units if j_units else [], j_units if j_units else []
     docs = j_units + c_units
-    # Use char and word n-grams for robustness; build two vectorizers and concatenate similarities
-    word_vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_df=0.99)
-    char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3, 5), min_df=1)
+    # word + char TF-IDF
+    word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.99)
+    char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
     try:
         Xw = word_vec.fit_transform(docs)
         Xc = char_vec.fit_transform(docs)
     except Exception:
-        return None
-    Jw, Cw = Xw[: len(j_units), :], Xw[len(j_units) :, :]
-    Jc, Cc = Xc[: len(j_units), :], Xc[len(j_units) :, :]
-    # Cosine similarities
+        return 0, [], []
+    Jw, Cw = Xw[:len(j_units), :], Xw[len(j_units):, :]
+    Jc, Cc = Xc[:len(j_units), :], Xc[len(j_units):, :]
     Sw = cosine_similarity(Jw, Cw)
     Sc = cosine_similarity(Jc, Cc)
-    # Combine
-    S = 0.6 * Sw + 0.4 * Sc
+    S = 0.65*Sw + 0.35*Sc
+    matched, missing = [], []
     pairs = []
-    covered, missing = [], []
-    threshold = 0.35  # conservative default for unsupervised
+    threshold = 0.36
     for i, ju in enumerate(j_units):
-        jrow = S[i]
-        jbest_idx = int(jrow.argmax())
-        jbest = float(jrow[jbest_idx])
-        cv_best = c_units[jbest_idx]
-        pairs.append({'job_unit': ju, 'cv_unit': cv_best, 'score': jbest})
-        (covered if jbest >= threshold else missing).append(ju)
-    avg = sum(p['score'] for p in pairs) / max(1, len(pairs))
-    match_score = int(round(max(0.0, min(1.0, avg)) * 100))
-    return {'match_score': match_score, 'matched': covered, 'missing': missing, 'pairs': pairs}
-
-# ---------------- Hybrid inference ----------------
-
-def analyze_hybrid(cv_text: str, job_text: str):
-    # Try semantic-lite first
-    sem = tfidf_semantic_score(job_text, cv_text)
-    if sem is None:
-        # fall back to keyword coverage only
-        kws = extract_keywords(job_text)
-        matched, missing = keyword_coverage(cv_text, kws)
-        score = coverage_score(matched, len(kws))
-        return score, matched, missing
-    # Blend with light keyword signal to stabilize edge cases
-    kws = extract_keywords(job_text)
-    kmatched, kmissing = keyword_coverage(cv_text, kws)
-    kscore = coverage_score(kmatched, len(kws)) if kws else 0
-    # Weighted blend: 80% semantic, 20% keyword
-    score = int(round(0.8 * sem['match_score'] + 0.2 * kscore))
-    # For UI compatibility, use matched/missing from semantic job units
-    matched = sem['matched'][:50]
-    missing = sem['missing'][:50]
-    return score, matched, missing
+        row = S[i]
+        bi = int(row.argmax()); bs = float(row[bi])
+        pairs.append({'job_unit': ju, 'cv_unit': c_units[bi], 'score': bs})
+        (matched if bs >= threshold else missing).append(ju)
+    avg = sum(p['score'] for p in pairs)/max(1,len(pairs))
+    score = int(round(max(0.0, min(1.0, avg))*100))
+    # expose minimal explainability via top pairs in response if needed later
+    return score, matched[:50], missing[:50]
 
 # ---------------- PDF parsing ----------------
 
@@ -149,7 +166,7 @@ def parse_pdf_bytes(data: bytes) -> str:
             pass
     return text
 
-# ---------------- UI template (unchanged layout) ----------------
+# ---------------- UI template (relax blocker, allow paste) ----------------
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -174,7 +191,8 @@ INDEX_HTML = """
     .actions { display:flex; gap:10px; margin-top:10px; }
     button { background:var(--accent); color:#051025; border:0; padding:10px 14px; border-radius:10px; font-weight:700; cursor:pointer; box-shadow: 0 6px 16px rgba(77,163,255,0.35); }
     button:disabled { opacity:0.6; cursor:not-allowed; }
-    pre { white-space:pre-wrap; background:#0f1524; padding:10px; border:1px solid var(--border); border-radius:10px; max-height:240px; overflow:auto; }
+    pre, textarea.cv { white-space:pre-wrap; background:#0f1524; padding:10px; border:1px solid var(--border); border-radius:10px; max-height:240px; overflow:auto; width:100%; min-height:120px; color:var(--text); }
+    .warn { color:#f59e0b; font-size:12px; }
     .results { display:grid; grid-template-columns: 140px 1fr; gap:12px; align-items:start; }
     .score { font-size:52px; font-weight:900; line-height:1; }
     .score.good { color:var(--good); }
@@ -197,6 +215,8 @@ INDEX_HTML = """
       <div id=\"pdf-status\" class=\"status\"></div>
       <label for=\"pdf-text\">Extracted text (preview)</label>
       <pre id=\"pdf-text\"></pre>
+      <div class=\"warn\">If your PDF is scanned or the preview is empty, paste your CV text below and still click Analyze.</div>
+      <textarea id=\"cv-fallback\" class=\"cv\" placeholder=\"Paste your CV text here if preview is empty...\"></textarea>
     </section>
 
     <section class=\"panel\" id=\"job-panel\">
@@ -211,9 +231,9 @@ INDEX_HTML = """
         <div class=\"results\">
           <div class=\"score\" id=\"score\">0</div>
           <div>
-            <div><strong>Matched keywords</strong></div>
+            <div><strong>Matched items</strong></div>
             <ul id=\"matched\"></ul>
-            <div style=\"margin-top:8px;\"><strong>Missing keywords</strong></div>
+            <div style=\"margin-top:8px;\"><strong>Missing items</strong></div>
             <ul id=\"missing\"></ul>
             <div style=\"margin-top:8px;\"><strong>Recommendations</strong></div>
             <ul id=\"recs\"></ul>
@@ -246,8 +266,11 @@ INDEX_HTML = """
       catch(e){ statusPDF('Upload failed: ' + e.message); }
     }); }
   async function analyze(){
-    const cv = el('pdf-text').textContent || ''; const job = el('job').value || '';
-    if(!cv.trim()){ statusAnalyze('Please upload and parse a CV first.'); return; }
+    const parsed = el('pdf-text').textContent || '';
+    const fallback = el('cv-fallback').value || '';
+    const cv = (parsed.trim()? parsed : fallback) || '';
+    const job = el('job').value || '';
+    if(!cv.trim()){ statusAnalyze('CV text is empty. Paste your CV text if PDF parsing failed.'); return; }
     if(!job.trim()){ statusAnalyze('Please paste the job requirements.'); return; }
     statusAnalyze('Analyzing...'); el('analyze').disabled = true;
     try{ const resp = await fetch('/api/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cv_text: cv, job_text: job }) });
@@ -290,6 +313,7 @@ def parse_pdf():
         data = f.read()
         text = parse_pdf_bytes(data)
         preview = (text or '')[:20000]
+        # Always ok True; client shows warning if empty
         return jsonify({'ok': True, 'text': preview, 'chars': len(text or '')})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -303,12 +327,16 @@ def analyze_api():
         if not cv.strip() or not job.strip():
             return jsonify({'ok': False, 'error': 'cv_text and job_text are required'}), 400
         score, matched, missing = analyze_hybrid(cv, job)
-        # Simple recommendations
+        # Recommendations
         recs = []
         if missing:
             recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
         if score < 60:
             recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
+        if 'experience' not in normalize_text(cv):
+            recs.append('Add a dedicated Experience section with impact-driven bullet points.')
+        if 'project' not in normalize_text(cv):
+            recs.append('Include 1–2 relevant projects with outcomes and technologies used.')
         return jsonify({'ok': True, 'match_score': score, 'matched_keywords': matched, 'missing_keywords': missing, 'recommendations': recs})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
