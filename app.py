@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Any
 
 import numpy as np
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, render_template_string, request, jsonify, render_template
 try:
     from bs4 import BeautifulSoup
 except Exception:
