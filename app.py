@@ -1,16 +1,12 @@
 from __future__ import annotations
 from flask import Flask, render_template_string, request, jsonify
-import os
-import re
+import os, re, json
 from typing import List, Tuple
 
 app = Flask(__name__)
 
 _token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
-_stopwords = {
-    'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from','this','that','you','your',
-    'we','our','they','their','them','it','its','if','else','then','will','shall','can','may','must','should'
-}
+_stopwords = { 'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from','this','that','you','your','we','our','they','their','them','it','its','if','else','then','will','shall','can','may','must','should' }
 
 def normalize_text(s: str) -> str:
     s = '' if s is None else str(s)
@@ -21,53 +17,25 @@ def normalize_text(s: str) -> str:
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
 
-# --- Robust enhancements: token normalization helpers ---
-def _simple_stem(tok: str) -> str:
-    if len(tok) > 4:
-        for suf in ('ing', 'ers', 'ies', 's'):
-            if tok.endswith(suf):
-                base = tok[:-len(suf)]
-                if len(base) >= 3:
-                    return base
-    return tok
-
-def _bigrams(tokens):
-    for i in range(len(tokens)-1):
-        yield tokens[i] + ' ' + tokens[i+1]
-
 def extract_keywords(job_text: str) -> List[str]:
     toks = tokenize(job_text)
-    toks = [_simple_stem(t) for t in toks]
     out, seen = [], set()
     for t in toks:
         if t in _stopwords:
             continue
         if t not in seen:
-            seen.add(t)
-            out.append(t)
-    for bg in _bigrams(toks):
-        if bg not in seen and all(p not in _stopwords for p in bg.split()):
-            seen.add(bg)
-            out.append(bg)
+            seen.add(t); out.append(t)
     return out
 
 def keyword_coverage(cv_text: str, keywords: List[str]) -> Tuple[List[str], List[str]]:
     cv_norm = normalize_text(cv_text)
-    cv_tokens = set(tokenize(cv_norm))
-    matched = []
-    missing = []
-    for k in keywords:
-        if ' ' in k:
-            (matched if k in cv_norm else missing).append(k)
-        else:
-            kk = _simple_stem(k)
-            (matched if (kk in cv_tokens or k in cv_norm) else missing).append(k)
+    matched = [k for k in keywords if k in cv_norm]
+    missing = [k for k in keywords if k not in cv_norm]
     return matched, missing
 
 def coverage_score(matched: List[str], total_keywords: int) -> int:
-    if total_keywords <= 0:
-        return 0
-    return int(round((len(matched) / float(total_keywords)) * 100))
+    if total_keywords <= 0: return 0
+    return int(round((len(matched)/float(total_keywords))*100))
 
 def recommendations(cv_text: str, matched: List[str], missing: List[str], score: int) -> List[str]:
     cv_lower = normalize_text(cv_text)
@@ -76,40 +44,98 @@ def recommendations(cv_text: str, matched: List[str], missing: List[str], score:
         recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
     if score < 60:
         recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
-    elif score < 80:
-        recs.append('Good overlap—strengthen impact statements with metrics and outcomes.')
     if 'experience' not in cv_lower:
         recs.append('Add a dedicated Experience section with impact-driven bullet points.')
     if 'projects' not in cv_lower and 'project' not in cv_lower:
         recs.append('Include 1–2 relevant projects with outcomes and technologies used.')
     return recs
 
-def parse_pdf_bytes(data: bytes) -> str:
-    if not data:
-        return ''
+ART_DIR = 'artifacts'
+word_vec = None
+char_vec = None
+pair_clf = None
+threshold = 0.5
+
+try:
+    import joblib
+    if os.path.exists(os.path.join(ART_DIR, 'tfidf_word.joblib')):
+        word_vec = joblib.load(os.path.join(ART_DIR, 'tfidf_word.joblib'))
+        char_vec = joblib.load(os.path.join(ART_DIR, 'tfidf_char.joblib'))
+        pair_clf = joblib.load(os.path.join(ART_DIR, 'pair_clf.joblib'))
+        cfgp = os.path.join(ART_DIR, 'config.json')
+        if os.path.exists(cfgp):
+            threshold = float(json.load(open(cfgp))['threshold'])
+except Exception as _e:
+    word_vec = None
+    char_vec = None
+    pair_clf = None
+
+_split_re = re.compile(r"[\n\r]+|\.\s+|;\s+|\-\s+")
+
+def split_units(text: str):
+    parts = _split_re.split(text or '')
+    return [p.strip() for p in parts if len(p.strip()) > 3]
+
+from math import isfinite
+
+def pair_score(j_unit: str, c_unit: str) -> float:
     try:
-        from pdfminer.high_level import extract_text
+        import numpy as np
     except Exception:
-        return ''
+        return 0.0
+    if word_vec is None or char_vec is None or pair_clf is None:
+        return 0.0
+    ju = [j_unit]; cu = [c_unit]
+    X_jw = word_vec.transform(ju); X_cw = word_vec.transform(cu)
+    X_jc = char_vec.transform(ju); X_cc = char_vec.transform(cu)
+    sim_word = (X_jw.multiply(X_cw)).sum(axis=1)
+    sim_char = (X_jc.multiply(X_cc)).sum(axis=1)
+    import numpy as np
+    X = np.hstack([np.asarray(sim_word).reshape(-1,1), np.asarray(sim_char).reshape(-1,1)])
+    try:
+        proba = float(pair_clf.predict_proba(X)[:,1][0])
+        return proba if isfinite(proba) else 0.0
+    except Exception:
+        return 0.0
+
+def analyze_semantic(cv_text: str, job_text: str):
+    j_units = split_units(job_text)
+    c_units = split_units(cv_text)
+    if not j_units or not c_units:
+        return {'match_score': 0, 'matched': [], 'missing': j_units if j_units else [], 'pairs': []}
+    pairs = []
+    covered, missing = [], []
+    for ju in j_units:
+        best = (None, 0.0)
+        for cu in c_units:
+            sc = pair_score(ju, cu)
+            if sc > best[1]:
+                best = (cu, sc)
+        pairs.append({'job_unit': ju, 'cv_unit': best[0], 'score': best[1]})
+        (covered if best[1] >= threshold else missing).append(ju)
+    avg = sum(p['score'] for p in pairs)/len(pairs)
+    return {'match_score': int(round(avg*100)), 'matched': covered, 'missing': missing, 'pairs': pairs}
+
+from pdfminer.high_level import extract_text as _extract
+
+def parse_pdf_bytes(data: bytes) -> str:
+    if not data: return ''
     tmp_path = '_upload_tmp.pdf'
-    text = ''
     try:
         with open(tmp_path, 'wb') as tmp:
             tmp.write(data)
-        text = extract_text(tmp_path) or ''
+        text = _extract(tmp_path) or ''
     finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        try: os.remove(tmp_path)
+        except Exception: pass
     return text
 
 INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta charset=\"utf-8\"> 
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> 
   <title>Bold CV Analyzer</title>
   <style>
     :root { --bg:#0b0f19; --panel:#151a29; --border:#22304a; --text:#e6ebff; --muted:#9fb0d7; --accent:#4da3ff; --good:#22c55e; --bad:#ef4444; }
@@ -183,66 +209,46 @@ INDEX_HTML = """
   function statusPDF(t){ el('pdf-status').textContent = t; }
   function statusAnalyze(t){ el('analyze-status').textContent = t; }
   function setScore(val){
-    const s = el('score');
-    s.textContent = val;
-    s.classList.remove('good','mid','bad');
-    if(val >= 75) s.classList.add('good');
-    else if(val >= 45) s.classList.add('mid');
-    else s.classList.add('bad');
+    const s = el('score'); s.textContent = val; s.classList.remove('good','mid','bad');
+    if(val >= 75) s.classList.add('good'); else if(val >= 45) s.classList.add('mid'); else s.classList.add('bad');
   }
-
   function bindPDF(){
-    const input = el('pdf') || document.querySelector('input[type=\"file\"][name=\"file\"]');
+    const input = el('pdf') || document.querySelector('input[type=\\"file\\"][name=\\"file\\"]');
     if(!input){ statusPDF('File input not found'); return; }
     input.accept = '.pdf';
     input.addEventListener('change', async function(){
       if(!input.files || !input.files[0]){ statusPDF('No file selected'); return; }
-      const f = input.files[0];
-      if(!/\\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
+      const f = input.files[0]; if(!/\\\\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
       statusPDF('Parsing PDF...');
-      try{
-        const fd = new FormData(); fd.append('file', f);
-        const resp = await fetch('/api/parse_pdf', {method:'POST', body:fd});
-        const data = await resp.json();
-        if(!data.ok){ statusPDF('Error: ' + (data.error || 'Unknown error')); return; }
-        statusPDF('Parsed ' + (data.chars||0) + ' characters');
-        el('pdf-text').textContent = data.text || '';
-      }catch(e){ statusPDF('Upload failed: ' + e.message); }
-    });
-  }
-
+      try{ const fd = new FormData(); fd.append('file', f); const resp = await fetch('/api/parse_pdf', {method:'POST', body:fd});
+        const data = await resp.json(); if(!data.ok){ statusPDF('Error: ' + (data.error || 'Unknown error')); return; }
+        statusPDF('Parsed ' + (data.chars||0) + ' characters'); el('pdf-text').textContent = data.text || ''; }
+      catch(e){ statusPDF('Upload failed: ' + e.message); }
+    }); }
   async function analyze(){
-    const cv = el('pdf-text').textContent || '';
-    const job = el('job').value || '';
+    const cv = el('pdf-text').textContent || ''; const job = el('job').value || '';
     if(!cv.trim()){ statusAnalyze('Please upload and parse a CV first.'); return; }
     if(!job.trim()){ statusAnalyze('Please paste the job requirements.'); return; }
-    statusAnalyze('Analyzing...');
-    el('analyze').disabled = true;
-    try{
-      const resp = await fetch('/api/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cv_text: cv, job_text: job }) });
-      const data = await resp.json();
-      if(!data.ok){ statusAnalyze('Error: ' + (data.error || 'Unknown error')); return; }
-      statusAnalyze('');
-      setScore(data.match_score || 0);
-      const matched = el('matched'); matched.innerHTML='';
-      const missing = el('missing'); missing.innerHTML='';
-      const recs = el('recs'); recs.innerHTML='';
+    statusAnalyze('Analyzing...'); el('analyze').disabled = true;
+    try{ const resp = await fetch('/api/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cv_text: cv, job_text: job }) });
+      const data = await resp.json(); if(!data.ok){ statusAnalyze('Error: ' + (data.error || 'Unknown error')); return; }
+      statusAnalyze(''); setScore(data.match_score || 0);
+      const matched = el('matched'); matched.innerHTML=''; const missing = el('missing'); missing.innerHTML=''; const recs = el('recs'); recs.innerHTML='';
       (data.matched_keywords||[]).slice(0,50).forEach(k=>{ const li=document.createElement('li'); li.textContent = k; matched.appendChild(li); });
       (data.missing_keywords||[]).slice(0,50).forEach(k=>{ const li=document.createElement('li'); li.textContent = k; missing.appendChild(li); });
       (data.recommendations||[]).slice(0,10).forEach(r=>{ const li=document.createElement('li'); li.textContent = r; recs.appendChild(li); });
-      el('results').style.display = '';
-    }catch(e){ statusAnalyze('Analyze failed: ' + e.message); }
-    finally { el('analyze').disabled = false; }
-  }
-
+      el('results').style.display = ''; }
+    catch(e){ statusAnalyze('Analyze failed: ' + e.message); }
+    finally { el('analyze').disabled = false; } }
   function bindAnalyze(){ el('analyze').addEventListener('click', analyze); }
-  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', ()=>{ bindPDF(); bindAnalyze(); }); }
-  else { bindPDF(); bindAnalyze(); }
+  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', ()=>{ bindPDF(); bindAnalyze(); }); } else { bindPDF(); bindAnalyze(); }
 })();
 </script>
 </body>
 </html>
 """
+
+from flask import Flask, render_template_string, request, jsonify
 
 @app.route('/')
 def index():
@@ -277,9 +283,15 @@ def analyze_api():
         job = data.get('job_text') or ''
         if not cv.strip() or not job.strip():
             return jsonify({'ok': False, 'error': 'cv_text and job_text are required'}), 400
-        kws = extract_keywords(job)
-        matched, missing = keyword_coverage(cv, kws)
-        score = coverage_score(matched, len(kws))
+        if pair_clf is not None:
+            res = analyze_semantic(cv, job)
+            matched = res['matched']
+            missing = res['missing']
+            score = res['match_score']
+        else:
+            kws = extract_keywords(job)
+            matched, missing = keyword_coverage(cv, kws)
+            score = coverage_score(matched, len(kws))
         recs = recommendations(cv, matched, missing, score)
         return jsonify({'ok': True, 'match_score': score, 'matched_keywords': matched, 'missing_keywords': missing, 'recommendations': recs})
     except Exception as e:
@@ -287,13 +299,3 @@ def analyze_api():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
-
-
-
-
-
-
-
-
-
-
