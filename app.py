@@ -345,10 +345,7 @@ class StrategyB:
         uni_hint = ''
         comp_hint = ''
         try:
-            for line in (cv + '
-'
-' + jd).split('
-'):
+            for line in (cv + "\n" + jd).split("\n"):
                 low = line.lower()
                 if 'univ' in low or 'university' in low:
                     uni_hint = line.strip()[:120]
