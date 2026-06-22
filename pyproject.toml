@@ -1,3 +1,18 @@
+[project]
+name = "cv-analyzer"
+version = "0.1.0"
+description = "Strategy B Flask app for semantic evaluation"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+dependencies = [
+  "flask==3.0.2",
+  "numpy==1.26.4",
+  "duckduckgo_search==5.3.1",
+  "requests==2.32.4",
+  "beautifulsoup4==4.12.3",
+  "pdfminer.six==20231228",
+]
+
 [tool.vercel]
 entrypoint = "app:app"
-
