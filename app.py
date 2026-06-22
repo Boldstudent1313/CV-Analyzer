@@ -344,7 +344,7 @@ class StrategyB:
         # Attempt to identify university and company cues from text
         uni_hint = ''
         comp_hint = ''
-        for line in (cv + '
+        for line in (cv + '\n')
 ' + jd).split('
 '):
             if 'univ' in line.lower() or 'university' in line.lower():
