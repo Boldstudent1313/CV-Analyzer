@@ -19,3 +19,7 @@ Deployment:
 
 - Configure Vercel Python builder.
 - Provide environment if needed.
+
+## Finalization
+
+Prepared for Vercel deployment.
