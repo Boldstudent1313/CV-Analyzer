@@ -344,13 +344,18 @@ class StrategyB:
         # Attempt to identify university and company cues from text
         uni_hint = ''
         comp_hint = ''
-        for line in (cv + '\n')
+        try:
+            for line in (cv + '
+'
 ' + jd).split('
 '):
-            if 'univ' in line.lower() or 'university' in line.lower():
-                uni_hint = line.strip()[:120]
-            if any(k in line.lower() for k in ['inc', 'llc', 'ltd', 'corp', 'company']):
-                comp_hint = line.strip()[:120]
+                low = line.lower()
+                if 'univ' in low or 'university' in low:
+                    uni_hint = line.strip()[:120]
+                if any(k in low for k in ['inc', 'llc', 'ltd', 'corp', 'company']):
+                    comp_hint = line.strip()[:120]
+        except Exception:
+            pass
         uni_score, uni_label = self.web.university_prestige(uni_hint or cv[:120])
         comp_score, comp_label = self.web.company_tier(comp_hint or jd[:120])
         proj_score, proj_label = self.web.project_uniqueness((jd + ' ' + cv)[:160])
@@ -362,7 +367,6 @@ class StrategyB:
             'project_score': proj_score,
             'project_label': proj_label,
         }
-
     def final_score(self, base: float, enrich: Dict[str, Any]) -> Tuple[float, str]:
         # Weighted adjustment: positive prestige and rarity boost; oversaturation penalizes if negative
         uni = enrich.get('uni_score', 0.0)
