@@ -1,45 +1,36 @@
+from __future__ import annotations
 
-# app.py - Strategy B Backend
-# NOTE: Designed for Vercel. Ensure global app variable.
 import os
-import io
 import re
 import json
-import math
-import time
-import base64
-import hashlib
-import logging
-import threading
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Any
-
-import numpy as np
-from flask import Flask, request, jsonify, render_template
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
-import requests
-
-# Global Flask app for Vercel import
-app = Flask(__name__)
-
-from __future__ import annotations
-from flask import Flask, render_template_string, request, jsonify
-import os, re, json
 from typing import List
 
+from flask import Flask, render_template_string, request, jsonify
+
+# App
 app = Flask(__name__)
 
+# Precompiled regexes
 _space_re = re.compile(r'\s+')
-
-# ---------------- Core text utils ----------------
 _token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
+_SPLIT_RE = re.compile(r"[\n\r]+|\.?\s*[.;]\s+|\u2022\s+|-{1}\s+")
+
+# Stopwords
 _stopwords = {
     'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from',
     'this','that','you','your','we','our','they','their','them','it','its','if','else','then','will',
     'shall','can','may','must','should'
 }
 
+# Optional sklearn imports (graceful if unavailable)
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
+
+# ---------------- Core text utils ----------------
 def normalize_text(s: str) -> str:
     s = '' if s is None else str(s)
     s = s.replace('\r',' ').replace('\t',' ')
@@ -49,26 +40,14 @@ def normalize_text(s: str) -> str:
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
 
-# ---------------- Semantic-lite branch ----------------
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-except Exception:
-    TfidfVectorizer = None
-    cosine_similarity = None
-
-_SPLIT_RE = re.compile(r"[\n\r]+|\.?\s*[\.;]\s+|\u2022\s+|-{1}\s+")
+def _split_safe(text: str) -> List[str]:
+    return _SPLIT_RE.split(text or '')
 
 def split_units(text: str, cap: int = 1200) -> List[str]:
     cap = 1200 if cap is None or cap > 1200 else cap
-    parts = _split_safe(text or '')
+    parts = _split_safe(text)
     out = [p.strip() for p in parts if len(p.strip()) > 6]
     return out[:cap]
-
-def _split_safe(text: str) -> List[str]:
-    # Robust splitter that handles newlines, bullets, punctuation; avoids raw incomplete regex strings
-    # We already compiled _SPLIT_RE with a complete raw string; apply it here safely.
-    return _SPLIT_RE.split(text)
 
 # ---------------- Enrichment (bounded, cached) ----------------
 _enrich_cache_path = 'artifacts/enrich_cache.json'
