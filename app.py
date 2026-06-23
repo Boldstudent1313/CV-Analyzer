@@ -405,7 +405,3 @@ def analyze_api():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
-
-Notes:
-- The earlier unterminated string error came from a raw string that started with r"[ and was never closed. This version uses fully formed raw strings and keeps any complex patterns precompiled at module scope, avoiding line breaks inside string literals.
-- If you still see an error after redeploy, paste the latest log snippet and I’ll correct it immediately.
