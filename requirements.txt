@@ -1,6 +1,9 @@
-flask==3.0.3
-scikit-learn==1.5.0
-pdfminer.six==20231228
-requests==2.32.4
-pypdf==4.2.0
-gunicorn==21.2.0
+- flask==3.0.3
+- scikit-learn==1.5.0
+- pdfminer.six==20231228
+- requests==2.32.4
+- pypdf==4.2.0
+- duckduckgo_search==5.3.1
+- gunicorn==21.2.0
+- GOOGLE_WEB_ENABLED=1 
+- WEB_ENRICH_TIMEOUT=1.2 
