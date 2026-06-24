@@ -4,7 +4,6 @@ import os
 import re
 import io
 import json
-import time
 from typing import List, Dict, Any, Tuple
 
 from flask import Flask, render_template_string, request, jsonify
@@ -16,12 +15,6 @@ try:
 except Exception:
     TfidfVectorizer = None
     cosine_similarity = None
-
-# Optional web enrichment library
-try:
-    from duckduckgo_search import DDGS
-except Exception:
-    DDGS = None
 
 app = Flask(__name__)
 
@@ -63,9 +56,8 @@ ALIASES: Dict[str, List[str]] = {
     ]
 }
 
-# Small background corpus to “pre-train” TF-IDF for better general semantic space
+# Small background corpus to “self-train” TF-IDF slightly
 BACKGROUND_CORPUS = [
-    # General skills/phrases
     "leadership team coordination stakeholder communication project planning mentoring coaching",
     "problem solving analytical thinking initiative ownership adaptability collaboration",
     "writing documentation reporting presentations public speaking",
@@ -74,7 +66,6 @@ BACKGROUND_CORPUS = [
     "product strategy user research roadmap experimentation metrics kpi alignment",
     "community involvement student societies volunteering clubs associations chapters"
 ]
-
 
 # ---------------- Text utilities ----------------
 def normalize_text(s: str) -> str:
@@ -95,10 +86,7 @@ def augment_with_np(units: List[str]) -> List[str]:
     out = []
     for u in units:
         nps = noun_phrases(u)[:5]
-        if nps:
-            out.append(u + ' ' + ' '.join(nps))
-        else:
-            out.append(u)
+        out.append(u + ' ' + ' '.join(nps) if nps else u)
     return out
 
 def _split_safe(text: str) -> List[str]:
@@ -128,39 +116,52 @@ def keyword_present(cv_norm: str, unit_norm: str) -> bool:
     hits = sum(1 for t in utoks if t in cv_norm)
     return hits >= max(1, len(utoks) // 2)
 
+# ---------------- Optional Google Custom Search ----------------
+# Enable by setting env vars in your host dashboard:
+# GOOGLE_API_KEY, GOOGLE_CX, GCS_ENABLED=1, optional GCS_TIMEOUT
+def gcs_enabled() -> bool:
+    return os.getenv('GCS_ENABLED', '0') == '1' and bool(os.getenv('GOOGLE_API_KEY')) and bool(os.getenv('GOOGLE_CX'))
 
-# ---------------- Optional web enrichment (duckduckgo_search) ----------------
-def web_enrich_terms(terms: List[str], max_terms: int = 3, per_term: int = 2, timeout: float = None) -> List[str]:
-    if os.getenv('GOOGLE_WEB_ENABLED', '0') != '1':
+def gcs_search(query: str, num: int = 3, timeout: float = None) -> list:
+    if not gcs_enabled():
         return []
-    if DDGS is None:
-        return []
-    timeout = timeout or float(os.getenv('WEB_ENRICH_TIMEOUT', '1.2'))
-    snippets: List[str] = []
-    picked = 0
+    import requests
+    api_key = os.getenv('GOOGLE_API_KEY', '')
+    cx = os.getenv('GOOGLE_CX', '')
+    timeout = timeout or float(os.getenv('GCS_TIMEOUT', '1.2'))
     try:
-        with DDGS() as ddgs:
-            for t in terms[:max_terms]:
-                try:
-                    # Safe search params; we’ll grab short summaries
-                    results = ddgs.text(t, max_results=per_term)
-                    for r in results or []:
-                        txt = (r.get('body') or r.get('title') or '')
-                        txt = _space_re.sub(' ', txt).strip()
-                        if txt:
-                            snippets.append(f"{t}: {txt[:240]}")
-                    picked += 1
-                    if picked >= max_terms:
-                        break
-                except Exception:
-                    continue
-        # Bound overall time by just returning what we have quickly
+        r = requests.get(
+            'https://www.googleapis.com/customsearch/v1',
+            params={'key': api_key, 'cx': cx, 'q': query, 'num': max(1, min(num, 5))},
+            timeout=timeout,
+            headers={'User-Agent': 'cv-analyzer/1.0'}
+        )
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get('items') or []
+            out = []
+            for it in items:
+                title = (it.get('title') or '').strip()
+                snippet = (it.get('snippet') or '').strip()
+                if title or snippet:
+                    out.append(_space_re.sub(' ', f"{title}. {snippet}").strip())
+            return out[:num]
     except Exception:
         pass
+    return []
+
+def expand_terms_with_gcs(terms: list, max_terms: int = 2, per_term: int = 2) -> list:
+    if not gcs_enabled():
+        return []
+    snippets = []
+    for t in terms[:max_terms]:
+        snips = gcs_search(t, num=per_term)
+        for s in snips:
+            if s:
+                snippets.append(f"{t}: {s[:240]}")
     return snippets[:max_terms * per_term]
 
-
-# ---------------- Enrichment (cache + web optional) ----------------
+# ---------------- Enrichment (wiki + optional web) ----------------
 _enrich_cache_path = 'artifacts/enrich_cache.json'
 _enrich_cache: Dict[str, str] = {}
 if os.path.exists(_enrich_cache_path):
@@ -209,7 +210,6 @@ def wiki_summary(term: str, timeout_sec: float = 1.0) -> str:
 
 def build_enriched_cv(cv_text: str, job_text: str) -> str:
     terms = extract_rare_terms(cv_text, top_k=10)
-    # Blend wiki summaries and optional web snippets
     snippets = []
     for t in terms[:6]:
         s = wiki_summary(t)
@@ -217,10 +217,10 @@ def build_enriched_cv(cv_text: str, job_text: str) -> str:
             snippets.append(f'{t}: {s}')
         if len(snippets) >= 5:
             break
-    # Optional web enrichment for a few salient terms (add from both CV and job for breadth)
-    if os.getenv('GOOGLE_WEB_ENABLED', '0') == '1':
+    # Optional: Google Custom Search snippets for uncommon terms in job+cv
+    if gcs_enabled():
         more_terms = list(set(terms + extract_rare_terms(job_text, top_k=6)))
-        web_snips = web_enrich_terms(more_terms, max_terms=3, per_term=2)
+        web_snips = expand_terms_with_gcs(more_terms, max_terms=2, per_term=2)
         for ws in web_snips:
             if ws:
                 snippets.append(ws[:280])
@@ -230,46 +230,79 @@ def build_enriched_cv(cv_text: str, job_text: str) -> str:
         return cv_text
     return cv_text + '\n\n' + '\n'.join(snippets)
 
+# ---------------- Evidence via projects ----------------
+def split_projects(cv_text: str) -> list:
+    tx = normalize_text(cv_text)
+    blocks = re.split(r'(?:\n{2,}|\.\s+|;\s+|\-\s+|\u2022\s+)', tx)
+    out = []
+    for b in blocks:
+        b2 = b.strip()
+        if len(b2) < 40:
+            continue
+        if ('project' in b2) or ('experience' in b2) or ('built ' in b2) or ('developed ' in b2) or ('led ' in b2):
+            out.append(b2)
+    if not out:
+        paras = [p.strip() for p in re.split(r'\n{2,}', tx) if len(p.strip()) > 60]
+        out = sorted(paras, key=len, reverse=True)[:6]
+    return out[:12]
+
+def salient_terms_for_requirement(unit: str, top_k: int = 5) -> list:
+    toks = tokenize(unit)
+    cand = [t for t in toks if len(t) >= 5 and t not in _stopwords]
+    seen, out = set(), []
+    for t in cand:
+        if t not in seen:
+            seen.add(t); out.append(t)
+        if len(out) >= top_k:
+            break
+    return out
 
 # ---------------- Hybrid inference (semantic + adaptive + small “self-train”) ----------------
 def fit_vectorizers(docs: List[str]) -> Tuple[Any, Any, Any, Any]:
-    # “Self-train” a little by fitting on background corpus + current docs
     base = BACKGROUND_CORPUS + docs
     word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.995)
     char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
     Xw = word_vec.fit_transform(base)
     Xc = char_vec.fit_transform(base)
-    return word_vec, char_vec, Xw, Xc  # Xw/Xc on base only (we’ll refit on docs below for shapes)
+    return word_vec, char_vec, Xw, Xc
 
 def analyze_hybrid(cv_text: str, job_text: str):
     if TfidfVectorizer is None or cosine_similarity is None:
         return 0, [], []
-    cv_enriched = build_enriched_cv(cv_text, job_text)
 
-    # Split and expand job units with aliases
+    # Prepare units
     j_units_raw = split_units(job_text, cap=200)
     if not j_units_raw:
         return 0, [], []
     j_variants = [expand_unit_aliases(ju) for ju in j_units_raw]
     j_units = j_units_raw[:]
 
-    # CV units
+    # CV units and projects
+    cv_enriched = build_enriched_cv(cv_text, job_text)
     c_units = split_units(cv_enriched, cap=900)
     if not c_units:
         return 0, [], []
+    projects = split_projects(cv_text)
 
-    # Augment with noun-phrases to improve overlap
+    # Optional: expand context via GCS for uncommon terms per requirement
+    web_context = {}
+    if gcs_enabled():
+        for i, ju in enumerate(j_units):
+            terms = salient_terms_for_requirement(ju, top_k=5)
+            if terms:
+                web_context[i] = expand_terms_with_gcs(terms, max_terms=2, per_term=2)
+
+    # Build docs with noun-phrase augmentation
     j_docs = augment_with_np(j_units)
     c_docs = augment_with_np(c_units)
     docs = j_docs + c_docs
 
-    # Small “self-train”: fit vectorizers on background + request docs to set vocab/weights
+    # Fit TF-IDF (self-train on background + docs)
     try:
         word_vec, char_vec, _, _ = fit_vectorizers(docs)
         Xw = word_vec.fit_transform(docs)
         Xc = char_vec.fit_transform(docs)
     except Exception:
-        # Fallback: simple fit on docs
         word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.99)
         char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
         try:
@@ -284,10 +317,17 @@ def analyze_hybrid(cv_text: str, job_text: str):
     Sc = cosine_similarity(Jc, Cc)
     S = 0.65*Sw + 0.35*Sc
 
-    matched, missing = [], []
-    pairs = []
+    # Evidence-based matching
     base_threshold = 0.32
     cv_norm = normalize_text(' '.join(c_units))
+    matched, missing = [], []
+    pairs = []
+
+    proj_norm = [normalize_text(p) for p in projects]
+    web_norm = {}
+    if web_context:
+        for i, snips in web_context.items():
+            web_norm[i] = [normalize_text(s) for s in snips]
 
     for i, ju in enumerate(j_units):
         row = S[i]
@@ -302,15 +342,36 @@ def analyze_hybrid(cv_text: str, job_text: str):
         thr = max(0.25, base_threshold - relax)
 
         is_match = bs >= thr
+        evidence = {'cosine': round(bs, 3), 'aliases': False, 'project_hit': False, 'web_hit': False}
 
         if not is_match:
             variants = j_variants[i]
             if any(v in cv_norm for v in variants):
                 is_match = True
+                evidence['aliases'] = True
             elif keyword_present(cv_norm, normalize_text(ju)):
                 is_match = True
+                evidence['aliases'] = True
 
-        pairs.append({'job_unit': ju, 'cv_unit': c_units[bi], 'score': bs})
+        if not evidence['project_hit']:
+            ubase = normalize_text(ju)
+            aliases = set(j_variants[i])
+            for p in proj_norm:
+                if ubase in p or any(a in p for a in aliases):
+                    evidence['project_hit'] = True
+                    break
+
+        if not evidence['web_hit'] and web_norm.get(i):
+            snippets = web_norm[i]
+            for s in snippets:
+                if s and (s in cv_norm or any(s in p for p in proj_norm)):
+                    evidence['web_hit'] = True
+                    break
+
+        if not is_match and evidence['aliases'] and (evidence['project_hit'] or evidence['web_hit']) and bs >= (thr * 0.8):
+            is_match = True
+
+        pairs.append({'job_unit': ju, 'cv_unit': c_units[bi], 'score': bs, 'evidence': evidence})
         if is_match:
             matched.append(ju)
         else:
@@ -319,7 +380,6 @@ def analyze_hybrid(cv_text: str, job_text: str):
     avg = sum(p['score'] for p in pairs)/max(1, len(pairs))
     score = int(round(max(0.0, min(1.0, avg))*100))
     return score, matched[:50], missing[:50]
-
 
 # ---------------- PDF/text parsing ----------------
 def parse_pdf_bytes(data: bytes) -> str:
@@ -366,7 +426,6 @@ def parse_pdf_bytes(data: bytes) -> str:
         except Exception:
             pass
     return text or ''
-
 
 # ---------------- UI ----------------
 INDEX_HTML = """
@@ -546,7 +605,6 @@ def analyze_api():
         if not cv.strip() or not job.strip():
             return jsonify({'ok': False, 'error': 'cv_text and job_text are required'}), 400
         score, matched, missing = analyze_hybrid(cv, job)
-
         recs = []
         if missing:
             recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
@@ -557,7 +615,6 @@ def analyze_api():
             recs.append('Add a dedicated Experience section with impact-driven bullet points.')
         if 'project' not in cv_norm_once:
             recs.append('Include 1–2 relevant projects with outcomes and technologies used.')
-
         return jsonify({'ok': True,
                         'match_score': score,
                         'matched_keywords': matched,
