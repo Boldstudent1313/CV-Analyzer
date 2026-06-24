@@ -2,27 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import io
 import json
-from typing import List
+import time
+from typing import List, Dict, Any, Tuple
 
 from flask import Flask, render_template_string, request, jsonify
 
-# App
-app = Flask(__name__)
-
-# Precompiled regexes
-_space_re = re.compile(r'\s+')
-_token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
-_SPLIT_RE = re.compile(r"[\n\r]+|\.?\s*[.;]\s+|\u2022\s+|-{1}\s+")
-
-# Stopwords
-_stopwords = {
-    'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from',
-    'this','that','you','your','we','our','they','their','them','it','its','if','else','then','will',
-    'shall','can','may','must','should'
-}
-
-# Optional sklearn imports (graceful if unavailable)
+# Optional imports (graceful degradation)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -30,7 +17,66 @@ except Exception:
     TfidfVectorizer = None
     cosine_similarity = None
 
-# ---------------- Core text utils ----------------
+# Optional web enrichment library
+try:
+    from duckduckgo_search import DDGS
+except Exception:
+    DDGS = None
+
+app = Flask(__name__)
+
+# ---------------- Precompiled regexes and constants ----------------
+_space_re = re.compile(r'\s+')
+_token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
+_SPLIT_RE = re.compile(r"[\n\r]+|\.?\s*[.;]\s+|\u2022\s+|-{1}\s+")
+_NP_RE = re.compile(r'(?:[a-z0-9+#.]+(?:\s+|\-)){0,3}(?:[a-z0-9+#.]+)')
+
+_stopwords = {
+    'and','or','the','for','with','to','of','in','on','a','an','is','are','as','by','be','at','from',
+    'this','that','you','your','we','our','they','their','them','it','its','if','else','then','will',
+    'shall','can','may','must','should'
+}
+
+# Aliases for common requirement phrases to improve recall
+ALIASES: Dict[str, List[str]] = {
+    'society involvement': [
+        'student society', 'student societies', 'societies', 'society',
+        'club', 'clubs', 'association', 'associations', 'chapter',
+        'student chapter', 'community work', 'community service',
+        'volunteering', 'volunteer work', 'extracurricular', 'campus activities'
+    ],
+    'leadership': [
+        'led', 'team lead', 'president', 'captain', 'chair', 'head',
+        'organized', 'coordinated', 'mentored', 'supervised'
+    ],
+    'communication skills': [
+        'presentation', 'presented', 'public speaking', 'stakeholder communication',
+        'report', 'reporting', 'documentation', 'writing', 'client communication'
+    ],
+    'teamwork': [
+        'collaborated', 'cross-functional', 'pair programming', 'scrum',
+        'agile', 'team project', 'coordination'
+    ],
+    'open source': [
+        'open-source', 'github contributions', 'maintainer', 'pull request',
+        'issue triage', 'community contributions'
+    ]
+}
+
+# Small background corpus to “pre-train” TF-IDF for better general semantic space
+BACKGROUND_CORPUS = [
+    # General skills/phrases
+    "leadership team coordination stakeholder communication project planning mentoring coaching",
+    "problem solving analytical thinking initiative ownership adaptability collaboration",
+    "writing documentation reporting presentations public speaking",
+    "applied statistics machine learning data pipelines visualization dashboards",
+    "rest apis microservices databases caching observability testing deployment ci cd",
+    "product strategy user research roadmap experimentation metrics kpi alignment",
+    "community involvement student societies volunteering clubs associations chapters"
+]
+
+
+# ---------------- Text utilities ----------------
 def normalize_text(s: str) -> str:
     s = '' if s is None else str(s)
     s = s.replace('\r',' ').replace('\t',' ')
@@ -39,6 +85,21 @@ def normalize_text(s: str) -> str:
 
 def tokenize(s: str) -> List[str]:
     return _token_re.findall(normalize_text(s))
+
+def noun_phrases(text: str) -> List[str]:
+    tx = normalize_text(text)
+    cands = _NP_RE.findall(tx)
+    return [c.strip() for c in cands if len(c.strip()) >= 6][:200]
+
+def augment_with_np(units: List[str]) -> List[str]:
+    out = []
+    for u in units:
+        nps = noun_phrases(u)[:5]
+        if nps:
+            out.append(u + ' ' + ' '.join(nps))
+        else:
+            out.append(u)
+    return out
 
 def _split_safe(text: str) -> List[str]:
     return _SPLIT_RE.split(text or '')
@@ -49,9 +110,59 @@ def split_units(text: str, cap: int = 1200) -> List[str]:
     out = [p.strip() for p in parts if len(p.strip()) > 6]
     return out[:cap]
 
-# ---------------- Enrichment (bounded, cached) ----------------
+def expand_unit_aliases(u: str) -> List[str]:
+    base = normalize_text(u)
+    alts = set([base])
+    for k, vals in ALIASES.items():
+        if k in base:
+            for v in vals:
+                alts.add(normalize_text(v))
+    return list(alts)
+
+def keyword_present(cv_norm: str, unit_norm: str) -> bool:
+    if unit_norm in cv_norm:
+        return True
+    utoks = set(tokenize(unit_norm)) - _stopwords
+    if not utoks:
+        return False
+    hits = sum(1 for t in utoks if t in cv_norm)
+    return hits >= max(1, len(utoks) // 2)
+
+
+# ---------------- Optional web enrichment (duckduckgo_search) ----------------
+def web_enrich_terms(terms: List[str], max_terms: int = 3, per_term: int = 2, timeout: float = None) -> List[str]:
+    if os.getenv('GOOGLE_WEB_ENABLED', '0') != '1':
+        return []
+    if DDGS is None:
+        return []
+    timeout = timeout or float(os.getenv('WEB_ENRICH_TIMEOUT', '1.2'))
+    snippets: List[str] = []
+    picked = 0
+    try:
+        with DDGS() as ddgs:
+            for t in terms[:max_terms]:
+                try:
+                    # Safe search params; we’ll grab short summaries
+                    results = ddgs.text(t, max_results=per_term)
+                    for r in results or []:
+                        txt = (r.get('body') or r.get('title') or '')
+                        txt = _space_re.sub(' ', txt).strip()
+                        if txt:
+                            snippets.append(f"{t}: {txt[:240]}")
+                    picked += 1
+                    if picked >= max_terms:
+                        break
+                except Exception:
+                    continue
+        # Bound overall time by just returning what we have quickly
+    except Exception:
+        pass
+    return snippets[:max_terms * per_term]
+
+
+# ---------------- Enrichment (cache + web optional) ----------------
 _enrich_cache_path = 'artifacts/enrich_cache.json'
-_enrich_cache = {}
+_enrich_cache: Dict[str, str] = {}
 if os.path.exists(_enrich_cache_path):
     try:
         _enrich_cache = json.load(open(_enrich_cache_path, 'r', encoding='utf-8'))
@@ -66,13 +177,12 @@ def extract_rare_terms(cv_text: str, top_k: int = 12) -> List[str]:
     seen, out = set(), []
     for t in cands:
         if t not in seen:
-            seen.add(t)
-            out.append(t)
+            seen.add(t); out.append(t)
         if len(out) >= top_k:
             break
     return out
 
-def wiki_summary(term: str, timeout_sec: float = 1.2) -> str:
+def wiki_summary(term: str, timeout_sec: float = 1.0) -> str:
     key = f'wik:{term}'
     if key in _enrich_cache:
         return _enrich_cache[key]
@@ -83,7 +193,7 @@ def wiki_summary(term: str, timeout_sec: float = 1.2) -> str:
         if r.status_code == 200:
             data = r.json()
             summ = data.get('extract') or ''
-            summ = re.sub(r'\s+', ' ', summ).strip()
+            summ = _space_re.sub(' ', summ).strip()
             if summ:
                 _enrich_cache[key] = summ[:400]
                 try:
@@ -97,54 +207,121 @@ def wiki_summary(term: str, timeout_sec: float = 1.2) -> str:
     _enrich_cache[key] = ''
     return ''
 
-def build_enriched_cv(cv_text: str) -> str:
+def build_enriched_cv(cv_text: str, job_text: str) -> str:
     terms = extract_rare_terms(cv_text, top_k=10)
+    # Blend wiki summaries and optional web snippets
     snippets = []
-    for t in terms:
+    for t in terms[:6]:
         s = wiki_summary(t)
         if s:
             snippets.append(f'{t}: {s}')
         if len(snippets) >= 5:
             break
+    # Optional web enrichment for a few salient terms (add from both CV and job for breadth)
+    if os.getenv('GOOGLE_WEB_ENABLED', '0') == '1':
+        more_terms = list(set(terms + extract_rare_terms(job_text, top_k=6)))
+        web_snips = web_enrich_terms(more_terms, max_terms=3, per_term=2)
+        for ws in web_snips:
+            if ws:
+                snippets.append(ws[:280])
+            if len(snippets) >= 8:
+                break
     if not snippets:
         return cv_text
     return cv_text + '\n\n' + '\n'.join(snippets)
 
-# ---------------- Hybrid inference (semantic-lite + enrichment) ----------------
+
+# ---------------- Hybrid inference (semantic + adaptive + small “self-train”) ----------------
+def fit_vectorizers(docs: List[str]) -> Tuple[Any, Any, Any, Any]:
+    # “Self-train” a little by fitting on background corpus + current docs
+    base = BACKGROUND_CORPUS + docs
+    word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.995)
+    char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
+    Xw = word_vec.fit_transform(base)
+    Xc = char_vec.fit_transform(base)
+    return word_vec, char_vec, Xw, Xc  # Xw/Xc on base only (we’ll refit on docs below for shapes)
+
 def analyze_hybrid(cv_text: str, job_text: str):
     if TfidfVectorizer is None or cosine_similarity is None:
         return 0, [], []
-    cv_enriched = build_enriched_cv(cv_text)
-    j_units = split_units(job_text, cap=200)
+    cv_enriched = build_enriched_cv(cv_text, job_text)
+
+    # Split and expand job units with aliases
+    j_units_raw = split_units(job_text, cap=200)
+    if not j_units_raw:
+        return 0, [], []
+    j_variants = [expand_unit_aliases(ju) for ju in j_units_raw]
+    j_units = j_units_raw[:]
+
+    # CV units
     c_units = split_units(cv_enriched, cap=900)
-    if not j_units or not c_units:
-        return 0, j_units if j_units else [], j_units if j_units else []
-    docs = j_units + c_units
-    word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.99)
-    char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
+    if not c_units:
+        return 0, [], []
+
+    # Augment with noun-phrases to improve overlap
+    j_docs = augment_with_np(j_units)
+    c_docs = augment_with_np(c_units)
+    docs = j_docs + c_docs
+
+    # Small “self-train”: fit vectorizers on background + request docs to set vocab/weights
     try:
+        word_vec, char_vec, _, _ = fit_vectorizers(docs)
         Xw = word_vec.fit_transform(docs)
         Xc = char_vec.fit_transform(docs)
     except Exception:
-        return 0, [], []
-    Jw, Cw = Xw[:len(j_units), :], Xw[len(j_units):, :]
-    Jc, Cc = Xc[:len(j_units), :], Xc[len(j_units):, :]
+        # Fallback: simple fit on docs
+        word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.99)
+        char_vec = TfidfVectorizer(analyzer='char', ngram_range=(3,5), min_df=1)
+        try:
+            Xw = word_vec.fit_transform(docs)
+            Xc = char_vec.fit_transform(docs)
+        except Exception:
+            return 0, [], []
+
+    Jw, Cw = Xw[:len(j_docs), :], Xw[len(j_docs):, :]
+    Jc, Cc = Xc[:len(j_docs), :], Xc[len(j_docs):, :]
     Sw = cosine_similarity(Jw, Cw)
     Sc = cosine_similarity(Jc, Cc)
     S = 0.65*Sw + 0.35*Sc
+
     matched, missing = [], []
     pairs = []
-    threshold = 0.36
+    base_threshold = 0.32
+    cv_norm = normalize_text(' '.join(c_units))
+
     for i, ju in enumerate(j_units):
         row = S[i]
-        bi = int(row.argmax()); bs = float(row[bi])
+        bi = int(row.argmax())
+        bs = float(row[bi])
+
+        relax = 0.0
+        if len(ju) <= 30:
+            relax += 0.02
+        if len(j_variants[i]) > 1:
+            relax += 0.02
+        thr = max(0.25, base_threshold - relax)
+
+        is_match = bs >= thr
+
+        if not is_match:
+            variants = j_variants[i]
+            if any(v in cv_norm for v in variants):
+                is_match = True
+            elif keyword_present(cv_norm, normalize_text(ju)):
+                is_match = True
+
         pairs.append({'job_unit': ju, 'cv_unit': c_units[bi], 'score': bs})
-        (matched if bs >= threshold else missing).append(ju)
-    avg = sum(p['score'] for p in pairs)/max(1,len(pairs))
+        if is_match:
+            matched.append(ju)
+        else:
+            missing.append(ju)
+
+    avg = sum(p['score'] for p in pairs)/max(1, len(pairs))
     score = int(round(max(0.0, min(1.0, avg))*100))
     return score, matched[:50], missing[:50]
 
-# ---------------- Hardened PDF/text parsing ----------------
+
+# ---------------- PDF/text parsing ----------------
 def parse_pdf_bytes(data: bytes) -> str:
     if not data:
         return ''
@@ -167,7 +344,6 @@ def parse_pdf_bytes(data: bytes) -> str:
     # Fallback: PyPDF
     if not text:
         try:
-            import io
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(data))
             pages = []
@@ -191,13 +367,14 @@ def parse_pdf_bytes(data: bytes) -> str:
             pass
     return text or ''
 
-# ---------------- UI template ----------------
+
+# ---------------- UI ----------------
 INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"> 
-  <meta name="viewport" content="width=device-width, initial-scale=1"> 
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bold CV Analyzer</title>
   <style>
     :root { --bg:#0b0f19; --panel:#151a29; --border:#22304a; --text:#e6ebff; --muted:#9fb0d7; --accent:#4da3ff; --good:#22c55e; --bad:#ef4444; }
@@ -369,16 +546,23 @@ def analyze_api():
         if not cv.strip() or not job.strip():
             return jsonify({'ok': False, 'error': 'cv_text and job_text are required'}), 400
         score, matched, missing = analyze_hybrid(cv, job)
+
         recs = []
         if missing:
             recs.append('Consider adding evidence for: ' + ', '.join(missing[:8]) + '.')
         if score < 60:
             recs.append('Tailor your CV summary to mirror key role requirements and metrics.')
-        if 'experience' not in normalize_text(cv):
+        cv_norm_once = normalize_text(cv)
+        if 'experience' not in cv_norm_once:
             recs.append('Add a dedicated Experience section with impact-driven bullet points.')
-        if 'project' not in normalize_text(cv):
+        if 'project' not in cv_norm_once:
             recs.append('Include 1–2 relevant projects with outcomes and technologies used.')
-        return jsonify({'ok': True, 'match_score': score, 'matched_keywords': matched, 'missing_keywords': missing, 'recommendations': recs})
+
+        return jsonify({'ok': True,
+                        'match_score': score,
+                        'matched_keywords': matched,
+                        'missing_keywords': missing,
+                        'recommendations': recs})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
