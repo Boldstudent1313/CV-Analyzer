@@ -117,7 +117,7 @@ def keyword_present(cv_norm: str, unit_norm: str) -> bool:
     return hits >= max(1, len(utoks) // 2)
 
 # ---------------- Optional Google Custom Search ----------------
-# Enable by setting env vars in your host dashboard:
+# Enable by setting env vars in Vercel Project Settings:
 # GOOGLE_API_KEY, GOOGLE_CX, GCS_ENABLED=1, optional GCS_TIMEOUT
 def gcs_enabled() -> bool:
     return os.getenv('GCS_ENABLED', '0') == '1' and bool(os.getenv('GOOGLE_API_KEY')) and bool(os.getenv('GOOGLE_CX'))
@@ -162,7 +162,7 @@ def expand_terms_with_gcs(terms: list, max_terms: int = 2, per_term: int = 2) ->
     return snippets[:max_terms * per_term]
 
 # ---------------- Enrichment (wiki + optional web) ----------------
-_enrich_cache_path = 'artifacts/enrich_cache.json'
+_enrich_cache_path = '/tmp/enrich_cache.json'  # Vercel only allows writing to /tmp
 _enrich_cache: Dict[str, str] = {}
 if os.path.exists(_enrich_cache_path):
     try:
@@ -198,7 +198,6 @@ def wiki_summary(term: str, timeout_sec: float = 1.0) -> str:
             if summ:
                 _enrich_cache[key] = summ[:400]
                 try:
-                    os.makedirs(os.path.dirname(_enrich_cache_path), exist_ok=True)
                     json.dump(_enrich_cache, open(_enrich_cache_path,'w',encoding='utf-8'))
                 except Exception:
                     pass
@@ -217,7 +216,6 @@ def build_enriched_cv(cv_text: str, job_text: str) -> str:
             snippets.append(f'{t}: {s}')
         if len(snippets) >= 5:
             break
-    # Optional: Google Custom Search snippets for uncommon terms in job+cv
     if gcs_enabled():
         more_terms = list(set(terms + extract_rare_terms(job_text, top_k=6)))
         web_snips = expand_terms_with_gcs(more_terms, max_terms=2, per_term=2)
@@ -381,7 +379,6 @@ def analyze_hybrid(cv_text: str, job_text: str):
     score = int(round(max(0.0, min(1.0, avg))*100))
     return score, matched[:50], missing[:50]
 
-# ---------------- PDF/text parsing ----------------
 def parse_pdf_bytes(data: bytes) -> str:
     if not data:
         return ''
@@ -389,7 +386,7 @@ def parse_pdf_bytes(data: bytes) -> str:
     # Try pdfminer
     try:
         from pdfminer.high_level import extract_text as _pdf_extract
-        tmp_path = '_upload_tmp.pdf'
+        tmp_path = '/tmp/_upload_tmp.pdf'
         with open(tmp_path, 'wb') as tmp:
             tmp.write(data)
         try:
@@ -623,5 +620,5 @@ def analyze_api():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+
+
