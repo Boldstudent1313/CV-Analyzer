@@ -1,7 +1,5 @@
-
 flask==3.0.3
 scikit-learn==1.5.0
 pdfminer.six==20231228
 requests==2.32.4
 pypdf==4.2.0
-gunicorn==21.2.0
