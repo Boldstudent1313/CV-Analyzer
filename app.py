@@ -8,7 +8,6 @@ from typing import List, Dict, Any, Tuple
 
 from flask import Flask, render_template_string, request, jsonify
 
-# Optional imports (graceful degradation)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -18,7 +17,6 @@ except Exception:
 
 app = Flask(__name__)
 
-# ---------------- Precompiled regexes and constants ----------------
 _space_re = re.compile(r'\s+')
 _token_re = re.compile(r"[a-zA-Z0-9+#.]{2,}")
 _SPLIT_RE = re.compile(r"[\n\r]+|\.?\s*[.;]\s+|\u2022\s+|-{1}\s+")
@@ -30,7 +28,6 @@ _stopwords = {
     'shall','can','may','must','should'
 }
 
-# Aliases for common requirement phrases to improve recall
 ALIASES: Dict[str, List[str]] = {
     'society involvement': [
         'student society', 'student societies', 'societies', 'society',
@@ -56,7 +53,6 @@ ALIASES: Dict[str, List[str]] = {
     ]
 }
 
-# Small background corpus to “self-train” TF-IDF slightly
 BACKGROUND_CORPUS = [
     "leadership team coordination stakeholder communication project planning mentoring coaching",
     "problem solving analytical thinking initiative ownership adaptability collaboration",
@@ -67,7 +63,6 @@ BACKGROUND_CORPUS = [
     "community involvement student societies volunteering clubs associations chapters"
 ]
 
-# ---------------- Text utilities ----------------
 def normalize_text(s: str) -> str:
     s = '' if s is None else str(s)
     s = s.replace('\r',' ').replace('\t',' ')
@@ -116,9 +111,6 @@ def keyword_present(cv_norm: str, unit_norm: str) -> bool:
     hits = sum(1 for t in utoks if t in cv_norm)
     return hits >= max(1, len(utoks) // 2)
 
-# ---------------- Optional Google Custom Search ----------------
-# Enable by setting env vars in Vercel Project Settings:
-# GOOGLE_API_KEY, GOOGLE_CX, GCS_ENABLED=1, optional GCS_TIMEOUT
 def gcs_enabled() -> bool:
     return os.getenv('GCS_ENABLED', '0') == '1' and bool(os.getenv('GOOGLE_API_KEY')) and bool(os.getenv('GOOGLE_CX'))
 
@@ -161,8 +153,7 @@ def expand_terms_with_gcs(terms: list, max_terms: int = 2, per_term: int = 2) ->
                 snippets.append(f"{t}: {s[:240]}")
     return snippets[:max_terms * per_term]
 
-# ---------------- Enrichment (wiki + optional web) ----------------
-_enrich_cache_path = '/tmp/enrich_cache.json'  # Vercel only allows writing to /tmp
+_enrich_cache_path = '/tmp/enrich_cache.json'
 _enrich_cache: Dict[str, str] = {}
 if os.path.exists(_enrich_cache_path):
     try:
@@ -228,7 +219,6 @@ def build_enriched_cv(cv_text: str, job_text: str) -> str:
         return cv_text
     return cv_text + '\n\n' + '\n'.join(snippets)
 
-# ---------------- Evidence via projects ----------------
 def split_projects(cv_text: str) -> list:
     tx = normalize_text(cv_text)
     blocks = re.split(r'(?:\n{2,}|\.\s+|;\s+|\-\s+|\u2022\s+)', tx)
@@ -255,7 +245,6 @@ def salient_terms_for_requirement(unit: str, top_k: int = 5) -> list:
             break
     return out
 
-# ---------------- Hybrid inference (semantic + adaptive + small “self-train”) ----------------
 def fit_vectorizers(docs: List[str]) -> Tuple[Any, Any, Any, Any]:
     base = BACKGROUND_CORPUS + docs
     word_vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.995)
@@ -268,21 +257,18 @@ def analyze_hybrid(cv_text: str, job_text: str):
     if TfidfVectorizer is None or cosine_similarity is None:
         return 0, [], []
 
-    # Prepare units
     j_units_raw = split_units(job_text, cap=200)
     if not j_units_raw:
         return 0, [], []
     j_variants = [expand_unit_aliases(ju) for ju in j_units_raw]
     j_units = j_units_raw[:]
 
-    # CV units and projects
     cv_enriched = build_enriched_cv(cv_text, job_text)
     c_units = split_units(cv_enriched, cap=900)
     if not c_units:
         return 0, [], []
     projects = split_projects(cv_text)
 
-    # Optional: expand context via GCS for uncommon terms per requirement
     web_context = {}
     if gcs_enabled():
         for i, ju in enumerate(j_units):
@@ -290,12 +276,10 @@ def analyze_hybrid(cv_text: str, job_text: str):
             if terms:
                 web_context[i] = expand_terms_with_gcs(terms, max_terms=2, per_term=2)
 
-    # Build docs with noun-phrase augmentation
     j_docs = augment_with_np(j_units)
     c_docs = augment_with_np(c_units)
     docs = j_docs + c_docs
 
-    # Fit TF-IDF (self-train on background + docs)
     try:
         word_vec, char_vec, _, _ = fit_vectorizers(docs)
         Xw = word_vec.fit_transform(docs)
@@ -315,75 +299,99 @@ def analyze_hybrid(cv_text: str, job_text: str):
     Sc = cosine_similarity(Jc, Cc)
     S = 0.65*Sw + 0.35*Sc
 
-    # Evidence-based matching
-    base_threshold = 0.32
     cv_norm = normalize_text(' '.join(c_units))
-    matched, missing = [], []
-    pairs = []
-
     proj_norm = [normalize_text(p) for p in projects]
     web_norm = {}
     if web_context:
         for i, snips in web_context.items():
             web_norm[i] = [normalize_text(s) for s in snips]
 
+    matched_flags = []
+    sim_scores = []
+    matched = []
+    missing = []
+
+    # More lenient base threshold
+    base_threshold = 0.26
+
     for i, ju in enumerate(j_units):
         row = S[i]
         bi = int(row.argmax())
         bs = float(row[bi])
 
+        # Dynamic relaxation
         relax = 0.0
         if len(ju) <= 30:
-            relax += 0.02
+            relax += 0.03
         if len(j_variants[i]) > 1:
-            relax += 0.02
-        thr = max(0.25, base_threshold - relax)
+            relax += 0.03
+
+        # Extra relaxation if literal or alias keyword hit
+        literal = normalize_text(ju) in cv_norm
+        alias_hit = any(v in cv_norm for v in j_variants[i])
+        if literal or alias_hit:
+            relax += 0.05
+
+        # Very lenient minimum
+        thr = max(0.18, base_threshold - relax)
 
         is_match = bs >= thr
-        evidence = {'cosine': round(bs, 3), 'aliases': False, 'project_hit': False, 'web_hit': False}
 
+        # Fallbacks that auto-accept if present
         if not is_match:
-            variants = j_variants[i]
-            if any(v in cv_norm for v in variants):
+            if literal:
                 is_match = True
-                evidence['aliases'] = True
+            elif alias_hit:
+                is_match = True
             elif keyword_present(cv_norm, normalize_text(ju)):
                 is_match = True
-                evidence['aliases'] = True
 
-        if not evidence['project_hit']:
+        # Project linkage (accept if project mentions unit or alias)
+        if not is_match:
             ubase = normalize_text(ju)
             aliases = set(j_variants[i])
             for p in proj_norm:
                 if ubase in p or any(a in p for a in aliases):
-                    evidence['project_hit'] = True
+                    is_match = True
                     break
 
-        if not evidence['web_hit'] and web_norm.get(i):
-            snippets = web_norm[i]
-            for s in snippets:
+        # Web snippet linkage (if enabled)
+        if not is_match and web_norm.get(i):
+            for s in web_norm[i]:
                 if s and (s in cv_norm or any(s in p for p in proj_norm)):
-                    evidence['web_hit'] = True
+                    is_match = True
                     break
 
-        if not is_match and evidence['aliases'] and (evidence['project_hit'] or evidence['web_hit']) and bs >= (thr * 0.8):
-            is_match = True
-
-        pairs.append({'job_unit': ju, 'cv_unit': c_units[bi], 'score': bs, 'evidence': evidence})
+        matched_flags.append(1 if is_match else 0)
+        sim_scores.append(max(0.0, bs))
         if is_match:
             matched.append(ju)
         else:
             missing.append(ju)
 
-    avg = sum(p['score'] for p in pairs)/max(1, len(pairs))
-    score = int(round(max(0.0, min(1.0, avg))*100))
+    # New final score: blend match rate and similarity average for leniency
+    # Match rate dominates to avoid low scores when requirements are clearly present textually
+    match_rate = sum(matched_flags) / max(1, len(matched_flags))
+    avg_sim = (sum(sim_scores) / max(1, len(sim_scores))) if sim_scores else 0.0
+
+    # Scale: 80% from match rate, 20% from similarity
+    blended = 0.8 * match_rate + 0.2 * avg_sim
+    score = int(round(max(0.0, min(1.0, blended)) * 100))
+
+    # Floor/ceiling smoothing to avoid very low scores when match rate is nonzero
+    if score < 25 and match_rate >= 0.25:
+        score = 25
+    if score < 50 and match_rate >= 0.6:
+        score = 50
+    if score < 70 and match_rate >= 0.8:
+        score = 70
+
     return score, matched[:50], missing[:50]
 
 def parse_pdf_bytes(data: bytes) -> str:
     if not data:
         return ''
     text = ''
-    # Try pdfminer
     try:
         from pdfminer.high_level import extract_text as _pdf_extract
         tmp_path = '/tmp/_upload_tmp.pdf'
@@ -398,7 +406,6 @@ def parse_pdf_bytes(data: bytes) -> str:
                 pass
     except Exception:
         text = ''
-    # Fallback: PyPDF
     if not text:
         try:
             from pypdf import PdfReader
@@ -414,7 +421,6 @@ def parse_pdf_bytes(data: bytes) -> str:
             text = '\n'.join([t for t in pages if t])
         except Exception:
             text = ''
-    # Fallback: decode as text if enough readable content
     if not text:
         try:
             guess = data.decode('utf-8', errors='ignore')
@@ -424,7 +430,6 @@ def parse_pdf_bytes(data: bytes) -> str:
             pass
     return text or ''
 
-# ---------------- UI ----------------
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -516,7 +521,7 @@ INDEX_HTML = """
     input.accept = '.pdf';
     input.addEventListener('change', async function(){
       if(!input.files || !input.files[0]){ statusPDF('No file selected'); return; }
-      const f = input.files[0]; if(!/\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
+      const f = input.files[0]; if(!/\\.pdf$/i.test(f.name)){ statusPDF('Please select a PDF'); return; }
       statusPDF('Parsing PDF...');
       try{
         const fd = new FormData(); fd.append('file', f);
@@ -564,7 +569,6 @@ INDEX_HTML = """
 </html>
 """
 
-# ---------------- Routes ----------------
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -619,6 +623,3 @@ def analyze_api():
                         'recommendations': recs})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
-
-
-
