@@ -7,8 +7,5 @@
   },
   "routes": [
     { "src": "/(.*)", "dest": "/app.py" }
-  ],
-  "env": {
-    "GCS_ENABLED": "0"
-  }
+  ]
 }
