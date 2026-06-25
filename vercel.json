@@ -1,12 +1,14 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "app.py", "use": "@vercel/python" }
-  ],
+  "functions": {
+    "app.py": {
+      "runtime": "python3.11"
+    }
+  },
   "routes": [
-    { "src": "/api/.*", "dest": "/app.py" },
     { "src": "/(.*)", "dest": "/app.py" }
   ],
   "env": {
     "GCS_ENABLED": "0"
   }
+}
